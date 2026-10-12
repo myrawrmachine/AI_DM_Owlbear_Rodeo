@@ -75,9 +75,15 @@
   <textarea id="brief" placeholder="Paste or write your secret notes here, or draft a one-shot above. Edit freely, then press Save brief."></textarea>
 
   <h4>2. Build the adventure map and monsters</h4>
-  <div class="hint">Reads your saved brief, draws the whole adventure as one connected map, then places every monster and NPC from the brief in its room. Save the brief first. Pressing again replaces the previous generated map and creatures.</div>
+  <div class="hint">Reads your saved brief, draws the whole adventure as one connected map, then places every monster and NPC from the brief in its room. Save the brief first. Pressing again replaces the previous generated map and creatures.<br>
+  <b>You must have a scene open.</b> If you don’t, click “Create blank scene” below, then open that scene in Owlbear’s Asset Manager and try again.</div>
   <div class="line"><input type="text" id="notes" placeholder="Optional extra instructions (e.g. make it a ruined swamp temple)"></div>
-  <div class="line">Cols <input type="number" id="cols" value="60" min="20" max="60"> Rows <input type="number" id="rows" value="40" min="15" max="45"><button id="build">Build map + monsters</button></div>
+  <div class="line">
+    Cols <input type="number" id="cols" value="60" min="20" max="60">
+    Rows <input type="number" id="rows" value="40" min="15" max="45">
+    <button id="build">Build map + monsters</button>
+    <button id="createScene" class="alt">Create blank scene</button>
+  </div>
   <div id="legend"></div>
 
   <h4>3. Add one more creature (optional)</h4>
@@ -99,7 +105,7 @@
 </div>
 
 <script type="module">
-import OBR, { buildShape, buildLabel } from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm";
+import OBR, { buildShape, buildLabel, buildSceneUpload } from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm";
 
 const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("input"), codeEl = $("code"), useMap = $("useMap");
@@ -246,212 +252,4 @@ input.addEventListener("keydown", (e) => {
 const gmStatus = (t) => { const el = $("gmstatus"); el.textContent = t; el.classList.toggle("bad", /^Problem/.test(t)); };
 function busyBtn(btn, label, fn) {
   btn.addEventListener("click", async () => {
-    const old = btn.textContent;
-    btn.disabled = true; btn.textContent = label;
-    try { await fn(); } catch (e) { console.error(e); gmStatus("Problem: " + e.message); }
-    btn.disabled = false; btn.textContent = old;
-  });
-}
-
-$("gmToggle").addEventListener("click", () => { $("story").hidden = true; $("gm").hidden = false; });
-$("gmBack").addEventListener("click", () => { $("gm").hidden = true; $("story").hidden = false; });
-
-busyBtn($("gmUnlock"), "Checking...", async () => {
-  store("gmcode", $("gmcode").value);
-  const d = await api(`/api/gm/brief?room=${encodeURIComponent(roomId)}`, null, true);
-  const local = store("brief-" + roomId) || "";
-  if (!d.brief && local) {
-    await api("/api/gm/brief", { room: roomId, brief: local }, true);
-    $("brief").value = local;
-    gmStatus("Unlocked. Your saved brief was restored to the server.");
-  } else {
-    $("brief").value = d.brief || "";
-    gmStatus("Unlocked.");
-  }
-  const m = savedMap();
-  if (m) $("legend").textContent = layoutText(m);
-});
-
-busyBtn($("draft"), "Drafting...", async () => {
-  const d = await api("/api/gm/oneshot", {
-    room: roomId, level: +$("lvl").value, players: +$("plr").value, theme: $("theme").value,
-  }, true);
-  $("brief").value = d.text;
-  gmStatus("Draft ready. Read it, edit it, then press Save brief.");
-});
-
-busyBtn($("saveBrief"), "Saving...", async () => {
-  const text = $("brief").value;
-  store("brief-" + roomId, text);
-  const d = await api("/api/gm/brief", { room: roomId, brief: text }, true);
-  gmStatus(`Brief saved (${d.length} characters). The DM will use it from the next Ask DM.`);
-});
-
-const FLOOR = { room: "#3a3f55", corridor: "#4a4f66", outdoor: "#3f5a3a", water: "#2f5d8a" };
-const THING = { pillar: "#8a8a99", door: "#a8742f", table: "#7a5a3a", statue: "#9a9aa8", water: "#3d78b5", hazard: "#b5483d", stairs: "#b9b9c9", tree: "#2f7a3a", chest: "#d4a72c", altar: "#8d5bb5" };
-
-async function clearGenerated() {
-  const old = await OBR.scene.items.getItems(
-    (i) => i.metadata && (i.metadata[GEN] === true || i.metadata[AUTO] === true)
-  );
-  if (old.length) await OBR.scene.items.deleteItems(old.map((i) => i.id));
-}
-
-async function drawMap(spec) {
-  const dpi = await getDpi();
-  const rect = (x, y, w, h, fill, stroke, name) =>
-    buildShape().width(w * dpi).height(h * dpi).shapeType("RECTANGLE")
-      .position({ x: x * dpi, y: y * dpi }).fillColor(fill).fillOpacity(1)
-      .strokeColor(stroke).strokeWidth(2).layer("MAP").name(name).locked(true)
-      .metadata({ [GEN]: true }).build();
-  const items = [rect(0, 0, spec.cols, spec.rows, "#15171f", "#15171f", spec.title)];
-  for (const a of spec.areas) items.push(rect(a.x, a.y, a.w, a.h, FLOOR[a.kind] || FLOOR.room, "#6b7090", a.name));
-  for (const f of spec.features) items.push(rect(f.x, f.y, f.w, f.h, THING[f.kind] || "#8a8a99", "#222", f.name));
-  await OBR.scene.items.addItems(items);
-  try {
-    await OBR.viewport.animateToBounds({ min: { x: 0, y: 0 }, max: { x: spec.cols * dpi, y: spec.rows * dpi } });
-  } catch (e) {}
-}
-
-async function spawnTokens(list, auto) {
-  const dpi = await getDpi();
-  const colors = { enemy: "#c0392b", npc: "#d4a72c", ally: "#2e86c1" };
-  const items = [];
-  for (const t of list) {
-    const meta = { [SIDE]: t.side };
-    if (auto) meta[AUTO] = true;
-    const shape = buildShape().width(dpi * (1 - 2 * OFF)).height(dpi * (1 - 2 * OFF)).shapeType("RECTANGLE")
-      .position({ x: (t.col + OFF) * dpi, y: (t.row + OFF) * dpi }).fillColor(colors[t.side] || colors.enemy)
-      .fillOpacity(0.9).strokeColor("#ffffff").strokeWidth(3).layer("CHARACTER").name(t.name)
-      .metadata(meta).build();
-    const tag = buildLabel().plainText(t.name).position({ x: (t.col + 0.5) * dpi, y: t.row * dpi })
-      .attachedTo(shape.id).pointerDirection("DOWN").metadata(auto ? { [AUTO]: true } : {}).build();
-    items.push(shape, tag);
-  }
-  if (items.length) await OBR.scene.items.addItems(items);
-}
-
-busyBtn($("build"), "Building...", async () => {
-  if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room to build the map.");
-  await ready;
-  if (!(await OBR.scene.isReady())) throw new Error("No scene is open. In Owlbear, create or open a scene first (the scenes menu), then try again.");
-  const text = $("brief").value;
-  if (!text.trim()) throw new Error("Write or draft a brief in section 1 first.");
-  gmStatus("Step 1 of 3: saving your brief...");
-  store("brief-" + roomId, text);
-  await api("/api/gm/brief", { room: roomId, brief: text }, true);
-  gmStatus("Step 2 of 3: the AI is designing the map and monsters. This can take up to a minute...");
-  const d = await api("/api/gm/build", {
-    room: roomId, notes: $("notes").value, cols: +$("cols").value, rows: +$("rows").value,
-  }, true);
-  gmStatus("Step 3 of 3: drawing the map...");
-  try {
-    await clearGenerated();
-    await drawMap(d.spec);
-    await spawnTokens(d.tokens, true);
-  } catch (e) { throw new Error("Drawing failed: " + e.message); }
-  store("map-" + roomId, JSON.stringify(d.spec));
-  const byArea = {};
-  d.tokens.forEach((t) => { (byArea[t.area] = byArea[t.area] || []).push(t.name); });
-  $("legend").textContent = layoutText(d.spec) + "\n\nCreatures placed:\n" +
-    (Object.keys(byArea).map((a) => `${a}: ${byArea[a].join(", ")}`).join("\n") || "none");
-  gmStatus(`Done. Built ${d.spec.areas.length} areas and ${d.tokens.length} creatures. If you can't see the map, zoom out in Owlbear.`);
-});
-
-busyBtn($("spawn"), "Spawning...", async () => {
-  if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room to spawn tokens.");
-  await ready;
-  const name = $("tname").value.trim() || "Creature";
-  const count = Math.max(1, Math.min(12, +$("tcount").value || 1));
-  const col = +$("tcol").value || 0, row = +$("trow").value || 0, side = $("tside").value;
-  const list = [];
-  for (let n = 0; n < count; n++) {
-    list.push({ name: count > 1 ? `${name} ${n + 1}` : name, side, col: col + (n % 4), row: row + Math.floor(n / 4) });
-  }
-  await spawnTokens(list, false);
-  gmStatus(`Spawned ${count} x ${name}.`);
-});
-
-function renderMoves() {
-  const box = $("moves");
-  box.innerHTML = "";
-  $("applyAll").hidden = pendingMoves.length < 2;
-  pendingMoves.forEach((m, idx) => {
-    const row = document.createElement("div");
-    row.className = "move";
-    const span = document.createElement("span");
-    span.textContent = `${tokenNames[m.id] || "Token"} to (${m.col}, ${m.row}): ${m.reason}`;
-    const b = document.createElement("button");
-    b.textContent = "Apply";
-    b.addEventListener("click", async () => {
-      try { await applyMoves([m]); pendingMoves.splice(idx, 1); renderMoves(); }
-      catch (e) { gmStatus("Problem: " + e.message); }
-    });
-    row.append(span, b);
-    box.appendChild(row);
-  });
-}
-
-async function applyMoves(moves) {
-  await ready;
-  const dpi = await getDpi();
-  const byId = {};
-  moves.forEach((m) => { byId[m.id] = m; });
-  await OBR.scene.items.updateItems(moves.map((m) => m.id), (items) => {
-    for (const it of items) {
-      const m = byId[it.id];
-      if (m) it.position = { x: (m.col + OFF) * dpi, y: (m.row + OFF) * dpi };
-    }
-  });
-}
-
-busyBtn($("suggest"), "Thinking...", async () => {
-  const tokens = await readTokens();
-  tokenNames = {};
-  tokens.forEach((t) => { tokenNames[t.id] = t.name; });
-  const m = savedMap();
-  const d = await api("/api/gm/moves", {
-    room: roomId, tokens, situation: $("situation").value,
-    layout: layoutText(m), cols: m ? m.cols : 40, rows: m ? m.rows : 30,
-  }, true);
-  pendingMoves = d.moves;
-  renderMoves();
-  gmStatus(d.moves.length ? (d.summary || "Moves suggested. Press Apply to make them.") : "The AI suggests no movement.");
-});
-
-$("applyAll").addEventListener("click", async () => {
-  try { await applyMoves(pendingMoves); pendingMoves = []; renderMoves(); gmStatus("All moves applied."); }
-  catch (e) { gmStatus("Problem: " + e.message); }
-});
-
-let clearArmed = false;
-$("clearBtn").addEventListener("click", async () => {
-  const b = $("clearBtn");
-  if (!clearArmed) {
-    clearArmed = true; b.textContent = "Really clear?";
-    setTimeout(() => { clearArmed = false; b.textContent = "Clear story"; }, 4000);
-    return;
-  }
-  clearArmed = false; b.textContent = "Clear story";
-  try { await api("/api/clear", { room: roomId }, true); gmStatus("Story cleared."); await fetchLog(); }
-  catch (e) { gmStatus("Problem: " + e.message); }
-});
-
-/* ---------- start ---------- */
-(async () => {
-  let isGm = !OBR.isAvailable; // outside Owlbear (testing) show GM tools
-  try {
-    if (OBR.isAvailable) {
-      await ready;
-      roomId = OBR.room.id || roomId;
-      myName = (await OBR.player.getName()) || myName;
-      isGm = (await OBR.player.getRole()) === "GM";
-    }
-  } catch (e) {}
-  if (isGm) $("gmToggle").hidden = false;
-  fetchLog();
-  setInterval(fetchLog, 3000);
-})();
-</script>
-</body>
-</html>
+    const 
