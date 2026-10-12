@@ -24,7 +24,11 @@
   #askBtn { background: #b8862b; }
   button.alt { background: #444b66; }
   button:disabled { opacity: .5; cursor: default; }
-  #gm { flex: 1; overflow-y: auto; padding: 8px 10px; }
+  #gm { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #gmhead { padding: 8px 10px 0; border-bottom: 1px solid #3a4057; }
+  #gmbody { flex: 1; overflow-y: auto; padding: 0 10px 12px; }
+  #gmstatus { margin: 6px 0 8px; padding: 6px 8px; background: #2a3045; border-radius: 6px; font-size: 13px; line-height: 1.35; min-height: 18px; }
+  #gmstatus.bad { background: #5a2a2f; color: #ffd4d4; }
   #gm h4 { margin: 14px 0 6px; color: #f1e3b0; }
   #gm .hint { font-size: 12px; color: #aab; margin: 2px 0 6px; }
   #gm .line { display: flex; gap: 6px; margin: 4px 0; flex-wrap: wrap; align-items: center; }
@@ -53,9 +57,12 @@
 </div>
 
 <div id="gm" hidden>
+ <div id="gmhead">
   <div class="line"><button id="gmBack" class="alt">Back to story</button></div>
   <div class="line"><label for="gmcode">GM code</label><input id="gmcode" type="password"><button id="gmUnlock">Unlock</button></div>
-  <div class="hint" id="gmstatus">Enter your GM code and press Unlock.</div>
+  <div id="gmstatus">Enter your GM code and press Unlock.</div>
+ </div>
+ <div id="gmbody">
 
   <h4>1. Secret adventure brief</h4>
   <div class="hint">Only you see this. The AI uses it as secret notes and never shows it to players directly.</div>
@@ -88,6 +95,7 @@
 
   <h4>Housekeeping</h4>
   <div class="line"><button id="clearBtn" class="alt">Clear story</button></div>
+</div>
 </div>
 
 <script type="module">
@@ -235,12 +243,12 @@ input.addEventListener("keydown", (e) => {
 });
 
 /* ---------- GM tools ---------- */
-const gmStatus = (t) => { $("gmstatus").textContent = t; };
+const gmStatus = (t) => { const el = $("gmstatus"); el.textContent = t; el.classList.toggle("bad", /^Problem/.test(t)); };
 function busyBtn(btn, label, fn) {
   btn.addEventListener("click", async () => {
     const old = btn.textContent;
     btn.disabled = true; btn.textContent = label;
-    try { await fn(); } catch (e) { gmStatus("Problem: " + e.message); }
+    try { await fn(); } catch (e) { console.error(e); gmStatus("Problem: " + e.message); }
     btn.disabled = false; btn.textContent = old;
   });
 }
@@ -326,22 +334,28 @@ async function spawnTokens(list, auto) {
 busyBtn($("build"), "Building...", async () => {
   if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room to build the map.");
   await ready;
+  if (!(await OBR.scene.isReady())) throw new Error("No scene is open. In Owlbear, create or open a scene first (the scenes menu), then try again.");
   const text = $("brief").value;
-  if (!text.trim()) throw new Error("Write or draft a brief in section 1 first, then press Save brief.");
+  if (!text.trim()) throw new Error("Write or draft a brief in section 1 first.");
+  gmStatus("Step 1 of 3: saving your brief...");
   store("brief-" + roomId, text);
-  await api("/api/gm/brief", { room: roomId, brief: text }, true); // make sure the server has the latest brief
+  await api("/api/gm/brief", { room: roomId, brief: text }, true);
+  gmStatus("Step 2 of 3: the AI is designing the map and monsters. This can take up to a minute...");
   const d = await api("/api/gm/build", {
     room: roomId, notes: $("notes").value, cols: +$("cols").value, rows: +$("rows").value,
   }, true);
-  await clearGenerated();
-  await drawMap(d.spec);
-  await spawnTokens(d.tokens, true);
+  gmStatus("Step 3 of 3: drawing the map...");
+  try {
+    await clearGenerated();
+    await drawMap(d.spec);
+    await spawnTokens(d.tokens, true);
+  } catch (e) { throw new Error("Drawing failed: " + e.message); }
   store("map-" + roomId, JSON.stringify(d.spec));
   const byArea = {};
   d.tokens.forEach((t) => { (byArea[t.area] = byArea[t.area] || []).push(t.name); });
   $("legend").textContent = layoutText(d.spec) + "\n\nCreatures placed:\n" +
     (Object.keys(byArea).map((a) => `${a}: ${byArea[a].join(", ")}`).join("\n") || "none");
-  gmStatus(`Built ${d.spec.areas.length} areas and ${d.tokens.length} creatures. Cells are numbered from 0 at the top-left of the map.`);
+  gmStatus(`Done. Built ${d.spec.areas.length} areas and ${d.tokens.length} creatures. If you can't see the map, zoom out in Owlbear.`);
 });
 
 busyBtn($("spawn"), "Spawning...", async () => {
