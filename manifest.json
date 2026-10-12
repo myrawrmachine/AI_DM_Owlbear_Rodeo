@@ -1,0 +1,15 @@
+{
+  "name": "AI Dungeon Master",
+  "version": "0.1.0",
+  "manifest_version": 1,
+  "description": "An AI DM that narrates, answers rules questions, and can see your map tokens.",
+  "author": "You",
+  "icon": "/icon.svg",
+  "action": {
+    "title": "AI Dungeon Master",
+    "icon": "/icon.svg",
+    "popover": "/index.html",
+    "width": 420,
+    "height": 600
+  }
+}

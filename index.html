@@ -1,0 +1,166 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Dungeon Master</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; }
+  body { background: #1e2231; color: #e8e8f0; font: 14px system-ui, sans-serif; display: flex; flex-direction: column; }
+  #log { flex: 1; overflow-y: auto; padding: 10px; }
+  .msg { margin: 0 0 10px; white-space: pre-wrap; line-height: 1.4; }
+  .you { color: #9db4ff; } .dm { color: #f1e3b0; } .sys { color: #ff9d9d; font-style: italic; }
+  #status { padding: 0 10px 4px; font-size: 12px; color: #aab; min-height: 16px; }
+  #bar, #cfg { display: flex; gap: 6px; padding: 8px; border-top: 1px solid #3a4057; align-items: center; }
+  #cfg { font-size: 12px; flex-wrap: wrap; }
+  textarea, #code { background: #2a3045; color: inherit; border: 1px solid #3a4057; border-radius: 6px; padding: 6px; }
+  textarea { flex: 1; height: 48px; resize: none; }
+  #code { flex: 1; min-width: 80px; }
+  button { background: #6b5bd6; color: #fff; border: 0; border-radius: 6px; padding: 0 12px; height: 48px; cursor: pointer; }
+  #askBtn { background: #b8862b; }
+  #clearBtn { height: 28px; background: #444b66; font-size: 12px; }
+  button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<div id="log"><div class="msg dm">Welcome, adventurers. Each player: type what your character does and press Say. When everyone has spoken, one person presses Ask DM.</div></div>
+<div id="status"></div>
+<div id="cfg">
+  <label for="code">Access code</label><input id="code" type="password">
+  <label><input type="checkbox" id="useMap" checked> send map</label>
+  <button id="clearBtn">Clear story</button>
+</div>
+<div id="bar">
+  <textarea id="input" placeholder="What does your character do?"></textarea>
+  <button id="sayBtn">Say</button>
+  <button id="askBtn">Ask DM</button>
+</div>
+
+<script type="module">
+import OBR from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm";
+
+const $ = (id) => document.getElementById(id);
+const log = $("log"), input = $("input"), codeEl = $("code"), useMap = $("useMap");
+const sayBtn = $("sayBtn"), askBtn = $("askBtn"), clearBtn = $("clearBtn"), status = $("status");
+
+let last = 0, roomId = "test-room", myName = "Player", lastErr = "", inflight = false, serverBusy = false, askBusy = false;
+
+const ready = OBR.isAvailable ? new Promise((r) => OBR.onReady(r)) : Promise.resolve();
+
+function store(k, v) {
+  try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; }
+}
+codeEl.value = store("dmcode") || "";
+codeEl.addEventListener("change", () => store("dmcode", codeEl.value));
+
+function add(cls, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + cls;
+  d.textContent = text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+
+async function api(path, body) {
+  const opts = { headers: { "Content-Type": "application/json", "X-Access-Code": codeEl.value } };
+  if (body) { opts.method = "POST"; opts.body = JSON.stringify(body); }
+  const r = await fetch(path, opts);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || "Error " + r.status);
+  return d;
+}
+
+function refreshUi() {
+  const thinking = serverBusy || askBusy;
+  askBtn.disabled = thinking;
+  status.textContent = thinking ? "The DM is thinking..." : "";
+}
+
+async function fetchLog() {
+  if (inflight) return;
+  inflight = true;
+  try {
+    const d = await api(`/api/log?room=${encodeURIComponent(roomId)}&since=${last}`);
+    if (d.latest < last) { log.innerHTML = ""; last = 0; }
+    else {
+      for (const m of d.msgs) {
+        last = m.id;
+        add(m.role === "dm" ? "dm" : "you", m.role === "dm" ? m.text : `${m.who}: ${m.text}`);
+      }
+    }
+    serverBusy = d.busy;
+    lastErr = "";
+  } catch (e) {
+    if (e.message !== lastErr) { add("sys", e.message); lastErr = e.message; }
+  } finally {
+    inflight = false;
+    refreshUi();
+  }
+}
+
+async function mapContext() {
+  try {
+    if (!OBR.isAvailable) return "";
+    await ready;
+    if (!(await OBR.scene.isReady())) return "";
+    let dpi = 150;
+    try { dpi = await OBR.scene.grid.getDpi(); } catch (e) {}
+    const items = await OBR.scene.items.getItems((i) => i.layer === "CHARACTER" || i.layer === "MOUNT");
+    return items
+      .map((i) => `${i.name || "Unnamed"} at cell (${Math.round(i.position.x / dpi)}, ${Math.round(i.position.y / dpi)})`)
+      .join("\n");
+  } catch (e) { return ""; }
+}
+
+async function say() {
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  try {
+    await api("/api/say", { room: roomId, who: myName, text });
+    await fetchLog();
+  } catch (e) { add("sys", "Problem: " + e.message); input.value = text; }
+}
+
+async function askDm() {
+  askBusy = true; refreshUi();
+  try {
+    const map = useMap.checked ? await mapContext() : "";
+    await api("/api/dm", { room: roomId, map });
+  } catch (e) { add("sys", "Problem: " + e.message); }
+  askBusy = false;
+  await fetchLog();
+}
+
+let clearArmed = false;
+clearBtn.addEventListener("click", async () => {
+  if (!clearArmed) {
+    clearArmed = true; clearBtn.textContent = "Really clear?";
+    setTimeout(() => { clearArmed = false; clearBtn.textContent = "Clear story"; }, 4000);
+    return;
+  }
+  clearArmed = false; clearBtn.textContent = "Clear story";
+  try { await api("/api/clear", { room: roomId }); await fetchLog(); } catch (e) { add("sys", "Problem: " + e.message); }
+});
+
+sayBtn.addEventListener("click", say);
+askBtn.addEventListener("click", askDm);
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); say(); }
+});
+
+(async () => {
+  try {
+    if (OBR.isAvailable) {
+      await ready;
+      roomId = OBR.room.id || roomId;
+      myName = (await OBR.player.getName()) || myName;
+    }
+  } catch (e) {}
+  fetchLog();
+  setInterval(fetchLog, 3000);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+{
+  "name": "owlbear-dm",
+  "version": "0.1.0",
+  "description": "AI Dungeon Master for Owlbear Rodeo",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
