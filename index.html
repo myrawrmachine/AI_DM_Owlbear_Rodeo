@@ -67,14 +67,14 @@
   <div class="line"><button id="draft">Draft one-shot</button><button id="saveBrief" class="alt">Save brief</button></div>
   <textarea id="brief" placeholder="Paste or write your secret notes here, or draft a one-shot above. Edit freely, then press Save brief."></textarea>
 
-  <h4>2. Map</h4>
-  <div class="hint">Draws rooms and objects on the map layer. Each press replaces the previous generated map.</div>
-  <div class="line"><input type="text" id="scene" placeholder="Describe the scene (e.g. flooded crypt with a central altar)"></div>
-  <div class="line">Cols <input type="number" id="cols" value="30" min="10" max="40"> Rows <input type="number" id="rows" value="20" min="8" max="30"><button id="genMap">Generate map</button></div>
+  <h4>2. Build the adventure map and monsters</h4>
+  <div class="hint">Reads your saved brief, draws the whole adventure as one connected map, then places every monster and NPC from the brief in its room. Save the brief first. Pressing again replaces the previous generated map and creatures.</div>
+  <div class="line"><input type="text" id="notes" placeholder="Optional extra instructions (e.g. make it a ruined swamp temple)"></div>
+  <div class="line">Cols <input type="number" id="cols" value="60" min="20" max="60"> Rows <input type="number" id="rows" value="40" min="15" max="45"><button id="build">Build map + monsters</button></div>
   <div id="legend"></div>
 
-  <h4>3. Spawn tokens</h4>
-  <div class="hint">Tokens made here can be moved by the AI's suggestions. Col and Row are grid cells.</div>
+  <h4>3. Add one more creature (optional)</h4>
+  <div class="hint">For anything the brief missed. Tokens made here can also be moved by the AI's suggestions. Col and Row are grid cells.</div>
   <div class="line"><input type="text" id="tname" placeholder="Name (e.g. Goblin)"> Count <input type="number" id="tcount" value="1" min="1" max="12"></div>
   <div class="line">Col <input type="number" id="tcol" value="5" min="0"> Row <input type="number" id="trow" value="5" min="0">
     <select id="tside"><option value="enemy">Enemy</option><option value="npc">NPC</option><option value="ally">Ally</option></select>
@@ -99,6 +99,7 @@ const sayBtn = $("sayBtn"), askBtn = $("askBtn"), status = $("status");
 
 const GEN = "com.aidm/generated";
 const SIDE = "com.aidm/side";
+const AUTO = "com.aidm/auto";
 const OFF = 0.05; // token inset, as a fraction of a cell
 
 let last = 0, roomId = "test-room", myName = "Player", lastErr = "", inflight = false, serverBusy = false, askBusy = false;
@@ -281,12 +282,15 @@ busyBtn($("saveBrief"), "Saving...", async () => {
 const FLOOR = { room: "#3a3f55", corridor: "#4a4f66", outdoor: "#3f5a3a", water: "#2f5d8a" };
 const THING = { pillar: "#8a8a99", door: "#a8742f", table: "#7a5a3a", statue: "#9a9aa8", water: "#3d78b5", hazard: "#b5483d", stairs: "#b9b9c9", tree: "#2f7a3a", chest: "#d4a72c", altar: "#8d5bb5" };
 
-async function drawMap(spec) {
-  if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room to draw the map.");
-  await ready;
-  const dpi = await getDpi();
-  const old = await OBR.scene.items.getItems((i) => i.metadata && i.metadata[GEN] === true);
+async function clearGenerated() {
+  const old = await OBR.scene.items.getItems(
+    (i) => i.metadata && (i.metadata[GEN] === true || i.metadata[AUTO] === true)
+  );
   if (old.length) await OBR.scene.items.deleteItems(old.map((i) => i.id));
+}
+
+async function drawMap(spec) {
+  const dpi = await getDpi();
   const rect = (x, y, w, h, fill, stroke, name) =>
     buildShape().width(w * dpi).height(h * dpi).shapeType("RECTANGLE")
       .position({ x: x * dpi, y: y * dpi }).fillColor(fill).fillOpacity(1)
@@ -301,37 +305,56 @@ async function drawMap(spec) {
   } catch (e) {}
 }
 
-busyBtn($("genMap"), "Designing...", async () => {
-  const d = await api("/api/gm/map", {
-    room: roomId, scene: $("scene").value, cols: +$("cols").value, rows: +$("rows").value,
+async function spawnTokens(list, auto) {
+  const dpi = await getDpi();
+  const colors = { enemy: "#c0392b", npc: "#d4a72c", ally: "#2e86c1" };
+  const items = [];
+  for (const t of list) {
+    const meta = { [SIDE]: t.side };
+    if (auto) meta[AUTO] = true;
+    const shape = buildShape().width(dpi * (1 - 2 * OFF)).height(dpi * (1 - 2 * OFF)).shapeType("RECTANGLE")
+      .position({ x: (t.col + OFF) * dpi, y: (t.row + OFF) * dpi }).fillColor(colors[t.side] || colors.enemy)
+      .fillOpacity(0.9).strokeColor("#ffffff").strokeWidth(3).layer("CHARACTER").name(t.name)
+      .metadata(meta).build();
+    const tag = buildLabel().plainText(t.name).position({ x: (t.col + 0.5) * dpi, y: t.row * dpi })
+      .attachedTo(shape.id).pointerDirection("DOWN").metadata(auto ? { [AUTO]: true } : {}).build();
+    items.push(shape, tag);
+  }
+  if (items.length) await OBR.scene.items.addItems(items);
+}
+
+busyBtn($("build"), "Building...", async () => {
+  if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room to build the map.");
+  await ready;
+  const text = $("brief").value;
+  if (!text.trim()) throw new Error("Write or draft a brief in section 1 first, then press Save brief.");
+  store("brief-" + roomId, text);
+  await api("/api/gm/brief", { room: roomId, brief: text }, true); // make sure the server has the latest brief
+  const d = await api("/api/gm/build", {
+    room: roomId, notes: $("notes").value, cols: +$("cols").value, rows: +$("rows").value,
   }, true);
+  await clearGenerated();
   await drawMap(d.spec);
+  await spawnTokens(d.tokens, true);
   store("map-" + roomId, JSON.stringify(d.spec));
-  $("legend").textContent = layoutText(d.spec);
-  gmStatus("Map drawn. Cells are numbered from 0 at the top-left corner of the map.");
+  const byArea = {};
+  d.tokens.forEach((t) => { (byArea[t.area] = byArea[t.area] || []).push(t.name); });
+  $("legend").textContent = layoutText(d.spec) + "\n\nCreatures placed:\n" +
+    (Object.keys(byArea).map((a) => `${a}: ${byArea[a].join(", ")}`).join("\n") || "none");
+  gmStatus(`Built ${d.spec.areas.length} areas and ${d.tokens.length} creatures. Cells are numbered from 0 at the top-left of the map.`);
 });
 
 busyBtn($("spawn"), "Spawning...", async () => {
   if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room to spawn tokens.");
   await ready;
-  const dpi = await getDpi();
   const name = $("tname").value.trim() || "Creature";
   const count = Math.max(1, Math.min(12, +$("tcount").value || 1));
   const col = +$("tcol").value || 0, row = +$("trow").value || 0, side = $("tside").value;
-  const color = { enemy: "#c0392b", npc: "#d4a72c", ally: "#2e86c1" }[side];
-  const items = [];
+  const list = [];
   for (let n = 0; n < count; n++) {
-    const label = count > 1 ? `${name} ${n + 1}` : name;
-    const c = col + (n % 4), r = row + Math.floor(n / 4);
-    const shape = buildShape().width(dpi * (1 - 2 * OFF)).height(dpi * (1 - 2 * OFF)).shapeType("RECTANGLE")
-      .position({ x: (c + OFF) * dpi, y: (r + OFF) * dpi }).fillColor(color).fillOpacity(0.9)
-      .strokeColor("#ffffff").strokeWidth(3).layer("CHARACTER").name(label)
-      .metadata({ [SIDE]: side }).build();
-    const tag = buildLabel().plainText(label).position({ x: (c + 0.5) * dpi, y: r * dpi })
-      .attachedTo(shape.id).pointerDirection("DOWN").build();
-    items.push(shape, tag);
+    list.push({ name: count > 1 ? `${name} ${n + 1}` : name, side, col: col + (n % 4), row: row + Math.floor(n / 4) });
   }
-  await OBR.scene.items.addItems(items);
+  await spawnTokens(list, false);
   gmStatus(`Spawned ${count} x ${name}.`);
 });
 

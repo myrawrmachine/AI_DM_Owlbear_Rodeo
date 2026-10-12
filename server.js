@@ -129,8 +129,8 @@ function recentStory(r, n) {
 // ---------- Map + moves helpers ----------
 function sanitizeMap(s) {
   s = s || {};
-  const cols = clampInt(s.cols, 10, 40, 30);
-  const rows = clampInt(s.rows, 8, 30, 20);
+  const cols = clampInt(s.cols, 10, 60, 40);
+  const rows = clampInt(s.rows, 8, 45, 30);
   const fix = (o) => {
     o = o || {};
     const x = clampInt(o.x, 0, cols - 1, 0);
@@ -142,19 +142,23 @@ function sanitizeMap(s) {
     title: str(s.title, 60) || "Map",
     cols,
     rows,
-    areas: list(s.areas, 20).map((a) => ({ name: str(a.name, 40) || "Area", kind: str(a.kind, 20) || "room", ...fix(a) })),
-    features: list(s.features, 40).map((f) => ({ name: str(f.name, 40) || "Feature", kind: str(f.kind, 20) || "pillar", ...fix(f) })),
+    areas: list(s.areas, 30).map((a) => ({ name: str(a.name, 40) || "Area", kind: str(a.kind, 20) || "room", ...fix(a) })),
+    features: list(s.features, 70).map((f) => ({ name: str(f.name, 40) || "Feature", kind: str(f.kind, 20) || "pillar", ...fix(f) })),
   };
 }
 
-const MAP_SYSTEM = `You design simple top-down battle maps for a D&D one-shot. Output ONLY valid JSON, no commentary.
-Schema: {"title": string, "cols": integer, "rows": integer, "areas": [{"name": string, "kind": "room"|"corridor"|"outdoor"|"water", "x": int, "y": int, "w": int, "h": int}], "features": [{"name": string, "kind": "pillar"|"door"|"table"|"statue"|"water"|"hazard"|"stairs"|"tree"|"chest"|"altar", "x": int, "y": int, "w": int, "h": int}]}
+const MAP_SYSTEM = `You design a single top-down battle map that contains an ENTIRE D&D one-shot, plus the creatures in it. Output ONLY valid JSON, no commentary.
+Schema: {"title": string, "cols": integer, "rows": integer,
+ "areas": [{"name": string, "kind": "room"|"corridor"|"outdoor"|"water", "x": int, "y": int, "w": int, "h": int}],
+ "features": [{"name": string, "kind": "pillar"|"door"|"table"|"statue"|"water"|"hazard"|"stairs"|"tree"|"chest"|"altar", "x": int, "y": int, "w": int, "h": int}],
+ "creatures": [{"name": string, "count": int, "side": "enemy"|"npc"|"ally", "area": string}]}
 Rules:
 - All numbers are whole grid cells (1 cell = 5 feet). x and y are the top-left cell, starting at 0. Everything must fit inside cols x rows.
-- "areas" are the walkable floor. Anything not covered by an area is solid rock or wall. Connect rooms with corridors (kind "corridor", 2 cells wide) so every area is reachable.
-- Use 3 to 8 areas. Rooms should be at least 5x5 cells. Leave empty space between rooms.
-- Put "features" inside areas: cover, hazards, doors at area edges, and one or two interesting objects. Use 6 to 20 features. Keep features small (1 to 3 cells).
-- Make the layout tactically interesting (chokepoints, cover, elevation-like obstacles) and match the scene description.`;
+- "areas" are the walkable floor. Anything not covered by an area is solid rock or wall.
+- Lay out EVERY scene or location in the adventure notes, in story order, from one end of the map to the other. Name each main area after its scene or location (for example "Scene 1: Flooded Entry"). Link areas with corridors (kind "corridor", 2 cells wide) so everything is reachable.
+- Use 6 to 16 areas. Rooms should be at least 5x5 cells, and big encounter rooms 8x8 or larger. Leave empty space between rooms.
+- Put "features" inside areas: cover, hazards, doors at area edges, and interesting objects that fit the story. Use 10 to 40 features. Keep each 1 to 3 cells.
+- "creatures": include EVERY monster and NPC from the notes, in the area where the party meets them. Use the exact area name. Use the counts in the notes (maximum 12 per entry). Give the creature name without numbers. Leave out the player characters.`;
 
 const MOVES_SYSTEM = `You control the enemies and NPCs in a tabletop D&D (2024, 5.5e) combat. Output ONLY valid JSON, no commentary.
 Schema: {"summary": string (one sentence on the enemy plan), "moves": [{"id": string, "col": int, "row": int, "reason": string (max 12 words)}]}
@@ -164,6 +168,43 @@ Rules:
 - Only end on walkable floor (inside a listed area, or anywhere if no map is given). Do not end on a cell with a token or on a blocking feature (pillar, statue, table, water, tree, altar, chest).
 - Play tactically but fairly: use cover, focus weak targets, protect leaders, and avoid unrealistic coordination. Cowardly or injured creatures may retreat.
 - You may omit tokens that should stay put.`;
+
+const BLOCKING = new Set(["pillar", "statue", "table", "water", "tree", "altar", "chest"]);
+function placeCreatures(spec, creatures) {
+  const occ = new Set();
+  for (const f of spec.features)
+    if (BLOCKING.has(f.kind))
+      for (let x = f.x; x < f.x + f.w; x++) for (let y = f.y; y < f.y + f.h; y++) occ.add(x + "," + y);
+  const placed = [];
+  for (const c of (Array.isArray(creatures) ? creatures : []).slice(0, 30)) {
+    const base = str(c.name, 40) || "Creature";
+    const side = ["enemy", "npc", "ally"].includes(c.side) ? c.side : "enemy";
+    const count = clampInt(c.count, 1, 12, 1);
+    const want = str(c.area, 60).toLowerCase();
+    const area =
+      spec.areas.find((a) => a.name.toLowerCase() === want) ||
+      (want && spec.areas.find((a) => a.name.toLowerCase().includes(want) || want.includes(a.name.toLowerCase()))) ||
+      spec.areas.find((a) => a.kind === "room") || spec.areas[0];
+    const cx = area.x + area.w / 2, cy = area.y + area.h / 2;
+    const cells = [];
+    for (let x = area.x; x < area.x + area.w; x++)
+      for (let y = area.y; y < area.y + area.h; y++) if (!occ.has(x + "," + y)) cells.push([x, y]);
+    cells.sort((p, q) => Math.hypot(p[0] + 0.5 - cx, p[1] + 0.5 - cy) - Math.hypot(q[0] + 0.5 - cx, q[1] + 0.5 - cy));
+    for (let i = 0; i < count && placed.length < 60; i++) {
+      const cell = cells.shift();
+      if (!cell) break;
+      occ.add(cell[0] + "," + cell[1]);
+      placed.push({ base, side, col: cell[0], row: cell[1], area: area.name });
+    }
+  }
+  const totals = {};
+  placed.forEach((p) => { totals[p.base] = (totals[p.base] || 0) + 1; });
+  const seen = {};
+  return placed.map((p) => {
+    seen[p.base] = (seen[p.base] || 0) + 1;
+    return { name: totals[p.base] > 1 ? `${p.base} ${seen[p.base]}` : p.base, side: p.side, col: p.col, row: p.row, area: p.area };
+  });
+}
 
 function layoutText(m) {
   if (!m || !Array.isArray(m.areas)) return "";
@@ -270,22 +311,26 @@ async function handleApi(req, res, url, query) {
       return json(res, 200, { text });
     }
 
-    if (url === "/api/gm/map") {
-      const scene = str(body.scene, 600) || "a small dungeon with a few rooms";
-      const cols = clampInt(body.cols, 10, 40, 30);
-      const rows = clampInt(body.rows, 8, 30, 20);
+    if (url === "/api/gm/build") {
+      if (!r.brief) return json(res, 400, { error: "Save a brief first (section 1). The map is built from it." });
+      const cols = clampInt(body.cols, 20, 60, 60);
+      const rows = clampInt(body.rows, 15, 45, 40);
+      const notes = str(body.notes, 500);
       const t = await gemini({
         model: PLAN_MODEL,
         json: true,
+        maxTokens: 8192,
         system: MAP_SYSTEM,
         contents: one(
-          `Map size: cols=${cols}, rows=${rows}.\nScene to build: ${scene}` +
-          (r.brief ? `\n\nAdventure notes for context (do not copy them):\n${r.brief.slice(0, 3000)}` : "")
+          `Map size: cols=${cols}, rows=${rows}.\n` + (notes ? `Extra instructions from the GM: ${notes}\n` : "") +
+          `\nADVENTURE NOTES:\n${r.brief.slice(0, 9000)}`
         ),
       });
-      const spec = sanitizeMap({ ...parseJson(t), cols, rows });
+      const parsed = parseJson(t);
+      const spec = sanitizeMap({ ...parsed, cols, rows });
       if (!spec.areas.length) throw new Error("The AI didn't produce any rooms. Please try again.");
-      return json(res, 200, { spec });
+      const tokens = placeCreatures(spec, parsed.creatures);
+      return json(res, 200, { spec, tokens });
     }
 
     if (url === "/api/gm/moves") {
