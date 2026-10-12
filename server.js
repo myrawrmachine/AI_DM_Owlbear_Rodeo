@@ -4,8 +4,10 @@ const path = require("path");
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.MODEL || "gemini-2.5-flash";
-const ACCESS_CODE = process.env.ACCESS_CODE || "";
+const MODEL = process.env.MODEL || "gemini-3.8-flash";          // used for the live story
+const PLAN_MODEL = process.env.PLAN_MODEL || MODEL;              // used for one-shots, maps, enemy moves
+const ACCESS_CODE = process.env.ACCESS_CODE || "";               // all players
+const GM_CODE = process.env.GM_CODE || "";                       // GM only
 
 const FILES = {
   "/": ["index.html", "text/html"],
@@ -21,13 +23,14 @@ const SYSTEM_PROMPT = `You are the Dungeon Master for a group of several players
 - If you are not sure about a rule, say so and give your best ruling instead of inventing an exact rule.
 - Each player message begins with that player's name. Several players may act in one round: respond to all of them, addressing players by name.
 - If a map snapshot is provided, use it for positions. Distances are in grid cells (1 cell = 5 ft).
+- When new enemies or NPCs appear, say clearly who and how many so the GM can place their tokens.
 - End scenes with a prompt like "What do you do?"`;
 
-// The story lives in memory, one log per Owlbear room. It resets if the server restarts or sleeps.
+// Everything lives in memory, one entry per Owlbear room. It resets if the server restarts or sleeps.
 const rooms = {};
 function getRoom(id) {
   id = String(id || "default").slice(0, 100);
-  if (!rooms[id]) rooms[id] = { msgs: [], next: 1, busy: false };
+  if (!rooms[id]) rooms[id] = { msgs: [], next: 1, busy: false, brief: "" };
   return rooms[id];
 }
 function addMsg(r, role, who, text) {
@@ -39,7 +42,7 @@ function headers(type) {
   return {
     "Content-Type": type,
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type, X-Access-Code",
+    "Access-Control-Allow-Headers": "Content-Type, X-Access-Code, X-GM-Code",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   };
 }
@@ -52,12 +55,55 @@ function readBody(req) {
     let d = "";
     req.on("data", (c) => {
       d += c;
-      if (d.length > 100000) { bad(new Error("Too big")); req.destroy(); }
+      if (d.length > 200000) { bad(new Error("Too big")); req.destroy(); }
     });
     req.on("end", () => ok(d));
     req.on("error", bad);
   });
 }
+const str = (v, n) => (typeof v === "string" ? v.trim().slice(0, n) : "");
+function clampInt(v, min, max, def) {
+  const n = Math.round(Number(v));
+  if (!isFinite(n)) return def;
+  return Math.min(max, Math.max(min, n));
+}
+
+// ---------- Gemini ----------
+async function gemini({ system, contents, json: wantJson, model, maxTokens }) {
+  const resp = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model || MODEL)}:generateContent`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": API_KEY },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents,
+        generationConfig: {
+          maxOutputTokens: maxTokens || 4096,
+          ...(wantJson ? { responseMimeType: "application/json" } : {}),
+        },
+      }),
+    }
+  );
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    if (resp.status === 429)
+      throw new Error("The free AI quota is used up for the moment. Wait a minute (or until tomorrow if it's the daily cap) and try again.");
+    throw new Error("AI error: " + ((data.error && data.error.message) || resp.status));
+  }
+  const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
+  const text = (parts || []).map((p) => p.text || "").join("").trim();
+  if (!text) throw new Error("The AI returned an empty answer (it may have been blocked). Try rephrasing.");
+  return text;
+}
+function parseJson(t) {
+  t = t.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  try { return JSON.parse(t); } catch (e) {}
+  const m = t.match(/\{[\s\S]*\}/);
+  if (m) { try { return JSON.parse(m[0]); } catch (e) {} }
+  throw new Error("The AI's answer wasn't in the expected format. Please try again.");
+}
+const one = (text) => [{ role: "user", parts: [{ text }] }];
 
 function buildContents(msgs) {
   const contents = [];
@@ -71,32 +117,72 @@ function buildContents(msgs) {
   while (contents.length && contents[0].role !== "user") contents.shift();
   return contents;
 }
+function briefBlock(r) {
+  return r.brief
+    ? "\n\nSECRET DM NOTES (players must not see these. Never quote them. Reveal information only through play, when the players earn it):\n" + r.brief
+    : "";
+}
+function recentStory(r, n) {
+  return r.msgs.slice(-n).map((m) => (m.role === "dm" ? "DM: " : m.who + ": ") + m.text).join("\n");
+}
 
-async function askGemini(r, map) {
-  const contents = buildContents(r.msgs);
-  const system = SYSTEM_PROMPT + (map ? "\n\nCurrent map snapshot:\n" + map : "");
-  const resp = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": API_KEY },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: system }] },
-        contents,
-        generationConfig: { maxOutputTokens: 2048 },
-      }),
-    }
+// ---------- Map + moves helpers ----------
+function sanitizeMap(s) {
+  s = s || {};
+  const cols = clampInt(s.cols, 10, 40, 30);
+  const rows = clampInt(s.rows, 8, 30, 20);
+  const fix = (o) => {
+    o = o || {};
+    const x = clampInt(o.x, 0, cols - 1, 0);
+    const y = clampInt(o.y, 0, rows - 1, 0);
+    return { x, y, w: clampInt(o.w, 1, cols - x, 1), h: clampInt(o.h, 1, rows - y, 1) };
+  };
+  const list = (v, n) => (Array.isArray(v) ? v.slice(0, n) : []);
+  return {
+    title: str(s.title, 60) || "Map",
+    cols,
+    rows,
+    areas: list(s.areas, 20).map((a) => ({ name: str(a.name, 40) || "Area", kind: str(a.kind, 20) || "room", ...fix(a) })),
+    features: list(s.features, 40).map((f) => ({ name: str(f.name, 40) || "Feature", kind: str(f.kind, 20) || "pillar", ...fix(f) })),
+  };
+}
+
+const MAP_SYSTEM = `You design simple top-down battle maps for a D&D one-shot. Output ONLY valid JSON, no commentary.
+Schema: {"title": string, "cols": integer, "rows": integer, "areas": [{"name": string, "kind": "room"|"corridor"|"outdoor"|"water", "x": int, "y": int, "w": int, "h": int}], "features": [{"name": string, "kind": "pillar"|"door"|"table"|"statue"|"water"|"hazard"|"stairs"|"tree"|"chest"|"altar", "x": int, "y": int, "w": int, "h": int}]}
+Rules:
+- All numbers are whole grid cells (1 cell = 5 feet). x and y are the top-left cell, starting at 0. Everything must fit inside cols x rows.
+- "areas" are the walkable floor. Anything not covered by an area is solid rock or wall. Connect rooms with corridors (kind "corridor", 2 cells wide) so every area is reachable.
+- Use 3 to 8 areas. Rooms should be at least 5x5 cells. Leave empty space between rooms.
+- Put "features" inside areas: cover, hazards, doors at area edges, and one or two interesting objects. Use 6 to 20 features. Keep features small (1 to 3 cells).
+- Make the layout tactically interesting (chokepoints, cover, elevation-like obstacles) and match the scene description.`;
+
+const MOVES_SYSTEM = `You control the enemies and NPCs in a tabletop D&D (2024, 5.5e) combat. Output ONLY valid JSON, no commentary.
+Schema: {"summary": string (one sentence on the enemy plan), "moves": [{"id": string, "col": int, "row": int, "reason": string (max 12 words)}]}
+Rules:
+- Only move tokens whose side is "enemy", "npc" or "ally". Tokens with side "pc" are the players: never move them.
+- Grid cells: 1 cell = 5 ft. Unless told otherwise, a token can move at most 6 cells per turn (diagonals count as 1 cell).
+- Only end on walkable floor (inside a listed area, or anywhere if no map is given). Do not end on a cell with a token or on a blocking feature (pillar, statue, table, water, tree, altar, chest).
+- Play tactically but fairly: use cover, focus weak targets, protect leaders, and avoid unrealistic coordination. Cowardly or injured creatures may retreat.
+- You may omit tokens that should stay put.`;
+
+function layoutText(m) {
+  if (!m || !Array.isArray(m.areas)) return "";
+  return (
+    `Map "${m.title}" ${m.cols}x${m.rows} cells. Walkable areas: ` +
+    m.areas.map((a) => `${a.name} (${a.kind}) x${a.x}-${a.x + a.w - 1}, y${a.y}-${a.y + a.h - 1}`).join("; ") +
+    ". Features: " +
+    (m.features || []).map((f) => `${f.name} (${f.kind}) at x${f.x}-${f.x + f.w - 1}, y${f.y}-${f.y + f.h - 1}`).join("; ")
   );
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    if (resp.status === 429)
-      throw new Error("The free AI quota is used up for the moment. Wait a minute and try again.");
-    throw new Error("AI error: " + ((data.error && data.error.message) || resp.status));
-  }
-  const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
-  const reply = (parts || []).map((p) => p.text || "").join("").trim();
-  if (!reply) throw new Error("The AI returned an empty answer (it may have been blocked). Try rephrasing.");
-  return reply;
+}
+
+// ---------- API ----------
+function isGm(req) {
+  return GM_CODE && req.headers["x-gm-code"] === GM_CODE;
+}
+function needGm(req, res) {
+  if (!GM_CODE) { json(res, 403, { error: "GM tools are off: set a GM_CODE variable in Render." }); return false; }
+  if (!isGm(req)) { json(res, 401, { error: "Wrong or missing GM code." }); return false; }
+  return true;
 }
 
 async function handleApi(req, res, url, query) {
@@ -107,30 +193,24 @@ async function handleApi(req, res, url, query) {
     if (req.method === "GET" && url === "/api/log") {
       const r = getRoom(query.get("room"));
       const since = parseInt(query.get("since") || "0", 10) || 0;
-      return json(res, 200, {
-        msgs: r.msgs.filter((m) => m.id > since),
-        latest: r.next - 1,
-        busy: r.busy,
-      });
+      return json(res, 200, { msgs: r.msgs.filter((m) => m.id > since), latest: r.next - 1, busy: r.busy });
     }
-
+    if (req.method === "GET" && url === "/api/gm/brief") {
+      if (!needGm(req, res)) return;
+      return json(res, 200, { brief: getRoom(query.get("room")).brief });
+    }
     if (req.method !== "POST") return json(res, 404, { error: "Not found" });
+
     let body;
     try { body = JSON.parse(await readBody(req)); }
     catch (e) { return json(res, 400, { error: "Bad request." }); }
     const r = getRoom(body.room);
 
     if (url === "/api/say") {
-      const text = typeof body.text === "string" ? body.text.trim().slice(0, 1000) : "";
-      const who = typeof body.who === "string" ? body.who.trim().slice(0, 40) || "Player" : "Player";
+      const text = str(body.text, 1000);
+      const who = str(body.who, 40) || "Player";
       if (!text) return json(res, 400, { error: "Empty message." });
       addMsg(r, "player", who, text);
-      return json(res, 200, { ok: true });
-    }
-
-    if (url === "/api/clear") {
-      r.msgs = [];
-      r.next = 1;
       return json(res, 200, { ok: true });
     }
 
@@ -140,15 +220,102 @@ async function handleApi(req, res, url, query) {
       const lastMsg = r.msgs[r.msgs.length - 1];
       if (!lastMsg || lastMsg.role === "dm")
         return json(res, 400, { error: "Nothing new for the DM to respond to. Have players say what they do first." });
-      const map = typeof body.map === "string" ? body.map.slice(0, 4000) : "";
+      const map = str(body.map, 5000);
       r.busy = true;
       try {
-        const reply = await askGemini(r, map);
+        const reply = await gemini({
+          system: SYSTEM_PROMPT + briefBlock(r) + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
+          contents: buildContents(r.msgs),
+          maxTokens: 2048,
+        });
         addMsg(r, "dm", "DM", reply);
       } finally {
         r.busy = false;
       }
       return json(res, 200, { ok: true });
+    }
+
+    // ----- GM only -----
+    if (!url.startsWith("/api/gm/") && url !== "/api/clear") return json(res, 404, { error: "Not found" });
+    if (!needGm(req, res)) return;
+
+    if (url === "/api/clear") {
+      r.msgs = [];
+      r.next = 1;
+      return json(res, 200, { ok: true });
+    }
+
+    if (url === "/api/gm/brief") {
+      r.brief = str(body.brief, 12000);
+      return json(res, 200, { ok: true, length: r.brief.length });
+    }
+
+    if (!API_KEY) return json(res, 500, { error: "Server has no GEMINI_API_KEY set." });
+
+    if (url === "/api/gm/oneshot") {
+      const level = clampInt(body.level, 1, 20, 3);
+      const players = clampInt(body.players, 1, 12, 5);
+      const theme = str(body.theme, 400) || "classic fantasy dungeon adventure";
+      const text = await gemini({
+        model: PLAN_MODEL,
+        system: "You are an expert Dungeons & Dragons (2024, 5.5e) adventure designer. Write clear, usable GM notes in plain text with simple headings. No markdown symbols other than line breaks and dashes.",
+        contents: one(
+          `Design a self-contained one-shot for ${players} players at level ${level}. Theme and tone: ${theme}.\n` +
+          `It must be finishable in about 3 hours. Use these headings:\n` +
+          `PREMISE AND HOOK\nSECRETS AND TWISTS (GM only)\nSCENES (3 or 4; for each: goal, challenge, NPCs, what the map needs)\n` +
+          `MONSTERS (name, CR, AC, HP, attacks with bonuses and damage, special traits)\nTREASURE\nENDINGS\n` +
+          `Keep it under 900 words. Be concrete: names, numbers, DCs.`
+        ),
+      });
+      return json(res, 200, { text });
+    }
+
+    if (url === "/api/gm/map") {
+      const scene = str(body.scene, 600) || "a small dungeon with a few rooms";
+      const cols = clampInt(body.cols, 10, 40, 30);
+      const rows = clampInt(body.rows, 8, 30, 20);
+      const t = await gemini({
+        model: PLAN_MODEL,
+        json: true,
+        system: MAP_SYSTEM,
+        contents: one(
+          `Map size: cols=${cols}, rows=${rows}.\nScene to build: ${scene}` +
+          (r.brief ? `\n\nAdventure notes for context (do not copy them):\n${r.brief.slice(0, 3000)}` : "")
+        ),
+      });
+      const spec = sanitizeMap({ ...parseJson(t), cols, rows });
+      if (!spec.areas.length) throw new Error("The AI didn't produce any rooms. Please try again.");
+      return json(res, 200, { spec });
+    }
+
+    if (url === "/api/gm/moves") {
+      const tokens = (Array.isArray(body.tokens) ? body.tokens : []).slice(0, 60).map((t) => ({
+        id: str(t.id, 80), name: str(t.name, 40) || "Token",
+        side: ["enemy", "npc", "ally"].includes(t.side) ? t.side : "pc",
+        col: clampInt(t.col, -100, 200, 0), row: clampInt(t.row, -100, 200, 0),
+      }));
+      const movable = tokens.filter((t) => t.side !== "pc");
+      if (!movable.length) return json(res, 400, { error: "No enemy/NPC tokens found. Use Spawn tokens first." });
+      const cols = clampInt(body.cols, 10, 200, 40);
+      const rows = clampInt(body.rows, 8, 200, 30);
+      const situation = str(body.situation, 500);
+      const t = await gemini({
+        model: PLAN_MODEL,
+        json: true,
+        system: MOVES_SYSTEM,
+        contents: one(
+          (str(body.layout, 4000) ? `${str(body.layout, 4000)}\n\n` : "") +
+          `Tokens (col,row are grid cells):\n` + tokens.map((k) => `- id=${k.id} name="${k.name}" side=${k.side} at (${k.col},${k.row})`).join("\n") +
+          (situation ? `\n\nGM note: ${situation}` : "") +
+          `\n\nRecent story:\n${recentStory(r, 8)}` + briefBlock(r)
+        ),
+      });
+      const parsed = parseJson(t);
+      const ids = new Set(movable.map((k) => k.id));
+      const moves = (Array.isArray(parsed.moves) ? parsed.moves : [])
+        .filter((m) => ids.has(m.id))
+        .map((m) => ({ id: m.id, col: clampInt(m.col, 0, cols - 1, 0), row: clampInt(m.row, 0, rows - 1, 0), reason: str(m.reason, 120) }));
+      return json(res, 200, { summary: str(parsed.summary, 300), moves });
     }
 
     json(res, 404, { error: "Not found" });

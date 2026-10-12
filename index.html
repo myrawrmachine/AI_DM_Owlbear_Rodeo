@@ -8,43 +8,101 @@
   :root { color-scheme: dark; }
   html, body { height: 100%; margin: 0; }
   body { background: #1e2231; color: #e8e8f0; font: 14px system-ui, sans-serif; display: flex; flex-direction: column; }
-  #log { flex: 1; overflow-y: auto; padding: 10px; }
   .msg { margin: 0 0 10px; white-space: pre-wrap; line-height: 1.4; }
   .you { color: #9db4ff; } .dm { color: #f1e3b0; } .sys { color: #ff9d9d; font-style: italic; }
+  #story { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #log { flex: 1; overflow-y: auto; padding: 10px; }
   #status { padding: 0 10px 4px; font-size: 12px; color: #aab; min-height: 16px; }
-  #bar, #cfg { display: flex; gap: 6px; padding: 8px; border-top: 1px solid #3a4057; align-items: center; }
-  #cfg { font-size: 12px; flex-wrap: wrap; }
-  textarea, #code { background: #2a3045; color: inherit; border: 1px solid #3a4057; border-radius: 6px; padding: 6px; }
+  .row { display: flex; gap: 6px; padding: 8px; border-top: 1px solid #3a4057; align-items: center; flex-wrap: wrap; }
+  .row.small { font-size: 12px; }
+  textarea, input, select { background: #2a3045; color: inherit; border: 1px solid #3a4057; border-radius: 6px; padding: 6px; font: inherit; }
   textarea { flex: 1; height: 48px; resize: none; }
-  #code { flex: 1; min-width: 80px; }
-  button { background: #6b5bd6; color: #fff; border: 0; border-radius: 6px; padding: 0 12px; height: 48px; cursor: pointer; }
+  input[type=text], input[type=password] { flex: 1; min-width: 70px; }
+  input[type=number] { width: 54px; }
+  button { background: #6b5bd6; color: #fff; border: 0; border-radius: 6px; padding: 0 12px; height: 34px; cursor: pointer; font: inherit; }
+  #sayBtn, #askBtn { height: 48px; }
   #askBtn { background: #b8862b; }
-  #clearBtn { height: 28px; background: #444b66; font-size: 12px; }
+  button.alt { background: #444b66; }
   button:disabled { opacity: .5; cursor: default; }
+  #gm { flex: 1; overflow-y: auto; padding: 8px 10px; }
+  #gm h4 { margin: 14px 0 6px; color: #f1e3b0; }
+  #gm .hint { font-size: 12px; color: #aab; margin: 2px 0 6px; }
+  #gm .line { display: flex; gap: 6px; margin: 4px 0; flex-wrap: wrap; align-items: center; }
+  #brief { width: 100%; height: 150px; box-sizing: border-box; resize: vertical; }
+  #legend { font-size: 12px; color: #c7c9d9; white-space: pre-wrap; margin-top: 6px; }
+  .move { display: flex; gap: 6px; align-items: center; margin: 4px 0; font-size: 13px; }
+  .move span { flex: 1; }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
-<div id="log"><div class="msg dm">Welcome, adventurers. Each player: type what your character does and press Say. When everyone has spoken, one person presses Ask DM.</div></div>
-<div id="status"></div>
-<div id="cfg">
-  <label for="code">Access code</label><input id="code" type="password">
-  <label><input type="checkbox" id="useMap" checked> send map</label>
-  <button id="clearBtn">Clear story</button>
+
+<div id="story">
+  <div id="log"><div class="msg dm">Welcome, adventurers. Each player: type what your character does and press Say. When everyone has spoken, one person presses Ask DM.</div></div>
+  <div id="status"></div>
+  <div class="row small">
+    <label for="code">Access code</label><input id="code" type="password">
+    <label><input type="checkbox" id="useMap" checked> send map</label>
+    <button id="gmToggle" class="alt" hidden>GM tools</button>
+  </div>
+  <div class="row">
+    <textarea id="input" placeholder="What does your character do?"></textarea>
+    <button id="sayBtn">Say</button>
+    <button id="askBtn">Ask DM</button>
+  </div>
 </div>
-<div id="bar">
-  <textarea id="input" placeholder="What does your character do?"></textarea>
-  <button id="sayBtn">Say</button>
-  <button id="askBtn">Ask DM</button>
+
+<div id="gm" hidden>
+  <div class="line"><button id="gmBack" class="alt">Back to story</button></div>
+  <div class="line"><label for="gmcode">GM code</label><input id="gmcode" type="password"><button id="gmUnlock">Unlock</button></div>
+  <div class="hint" id="gmstatus">Enter your GM code and press Unlock.</div>
+
+  <h4>1. Secret adventure brief</h4>
+  <div class="hint">Only you see this. The AI uses it as secret notes and never shows it to players directly.</div>
+  <div class="line">
+    Level <input type="number" id="lvl" value="3" min="1" max="20">
+    Players <input type="number" id="plr" value="5" min="1" max="12">
+    <input type="text" id="theme" placeholder="Theme / tone (e.g. spooky swamp mystery)">
+  </div>
+  <div class="line"><button id="draft">Draft one-shot</button><button id="saveBrief" class="alt">Save brief</button></div>
+  <textarea id="brief" placeholder="Paste or write your secret notes here, or draft a one-shot above. Edit freely, then press Save brief."></textarea>
+
+  <h4>2. Map</h4>
+  <div class="hint">Draws rooms and objects on the map layer. Each press replaces the previous generated map.</div>
+  <div class="line"><input type="text" id="scene" placeholder="Describe the scene (e.g. flooded crypt with a central altar)"></div>
+  <div class="line">Cols <input type="number" id="cols" value="30" min="10" max="40"> Rows <input type="number" id="rows" value="20" min="8" max="30"><button id="genMap">Generate map</button></div>
+  <div id="legend"></div>
+
+  <h4>3. Spawn tokens</h4>
+  <div class="hint">Tokens made here can be moved by the AI's suggestions. Col and Row are grid cells.</div>
+  <div class="line"><input type="text" id="tname" placeholder="Name (e.g. Goblin)"> Count <input type="number" id="tcount" value="1" min="1" max="12"></div>
+  <div class="line">Col <input type="number" id="tcol" value="5" min="0"> Row <input type="number" id="trow" value="5" min="0">
+    <select id="tside"><option value="enemy">Enemy</option><option value="npc">NPC</option><option value="ally">Ally</option></select>
+    <button id="spawn">Spawn</button></div>
+
+  <h4>4. Enemy moves</h4>
+  <div class="hint">The AI suggests where enemies and NPCs should go. Nothing moves until you press Apply.</div>
+  <div class="line"><input type="text" id="situation" placeholder="Optional note (e.g. goblins are scared of fire)"></div>
+  <div class="line"><button id="suggest">Suggest moves</button><button id="applyAll" class="alt" hidden>Apply all</button></div>
+  <div id="moves"></div>
+
+  <h4>Housekeeping</h4>
+  <div class="line"><button id="clearBtn" class="alt">Clear story</button></div>
 </div>
 
 <script type="module">
-import OBR from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm";
+import OBR, { buildShape, buildLabel } from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm";
 
 const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("input"), codeEl = $("code"), useMap = $("useMap");
-const sayBtn = $("sayBtn"), askBtn = $("askBtn"), clearBtn = $("clearBtn"), status = $("status");
+const sayBtn = $("sayBtn"), askBtn = $("askBtn"), status = $("status");
+
+const GEN = "com.aidm/generated";
+const SIDE = "com.aidm/side";
+const OFF = 0.05; // token inset, as a fraction of a cell
 
 let last = 0, roomId = "test-room", myName = "Player", lastErr = "", inflight = false, serverBusy = false, askBusy = false;
+let dpiCache = 0, pendingMoves = [], tokenNames = {};
 
 const ready = OBR.isAvailable ? new Promise((r) => OBR.onReady(r)) : Promise.resolve();
 
@@ -52,6 +110,7 @@ function store(k, v) {
   try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; }
 }
 codeEl.value = store("dmcode") || "";
+$("gmcode").value = store("gmcode") || "";
 codeEl.addEventListener("change", () => store("dmcode", codeEl.value));
 
 function add(cls, text) {
@@ -62,8 +121,10 @@ function add(cls, text) {
   log.scrollTop = log.scrollHeight;
 }
 
-async function api(path, body) {
-  const opts = { headers: { "Content-Type": "application/json", "X-Access-Code": codeEl.value } };
+async function api(path, body, gm) {
+  const headers = { "Content-Type": "application/json", "X-Access-Code": codeEl.value };
+  if (gm) headers["X-GM-Code"] = $("gmcode").value;
+  const opts = { headers };
   if (body) { opts.method = "POST"; opts.body = JSON.stringify(body); }
   const r = await fetch(path, opts);
   const d = await r.json().catch(() => ({}));
@@ -71,6 +132,7 @@ async function api(path, body) {
   return d;
 }
 
+/* ---------- shared story ---------- */
 function refreshUi() {
   const thinking = serverBusy || askBusy;
   askBtn.disabled = thinking;
@@ -99,20 +161,52 @@ async function fetchLog() {
   }
 }
 
+/* ---------- map helpers ---------- */
+async function getDpi() {
+  if (dpiCache) return dpiCache;
+  let dpi = 150;
+  try { if (OBR.isAvailable) { await ready; dpi = (await OBR.scene.grid.getDpi()) || 150; } } catch (e) {}
+  dpiCache = dpi;
+  return dpi;
+}
+
+async function readTokens() {
+  if (!OBR.isAvailable) return [];
+  await ready;
+  if (!(await OBR.scene.isReady())) return [];
+  const dpi = await getDpi();
+  const items = await OBR.scene.items.getItems(
+    (i) => (i.layer === "CHARACTER" || i.layer === "MOUNT") && (i.type === "IMAGE" || i.type === "SHAPE")
+  );
+  return items.map((i) => ({
+    id: i.id,
+    name: i.name || "Unnamed",
+    side: (i.metadata && i.metadata[SIDE]) || "pc",
+    col: Math.round(i.position.x / dpi),
+    row: Math.round(i.position.y / dpi),
+  }));
+}
+
+function savedMap() {
+  try { return JSON.parse(store("map-" + roomId) || "null"); } catch (e) { return null; }
+}
+function layoutText(m) {
+  if (!m || !Array.isArray(m.areas)) return "";
+  return `Map "${m.title}" ${m.cols}x${m.rows} cells. Walkable areas: ` +
+    m.areas.map((a) => `${a.name} (${a.kind}) x${a.x}-${a.x + a.w - 1}, y${a.y}-${a.y + a.h - 1}`).join("; ") +
+    ". Features: " + (m.features || []).map((f) => `${f.name} (${f.kind}) at x${f.x}-${f.x + f.w - 1}, y${f.y}-${f.y + f.h - 1}`).join("; ");
+}
+
 async function mapContext() {
   try {
-    if (!OBR.isAvailable) return "";
-    await ready;
-    if (!(await OBR.scene.isReady())) return "";
-    let dpi = 150;
-    try { dpi = await OBR.scene.grid.getDpi(); } catch (e) {}
-    const items = await OBR.scene.items.getItems((i) => i.layer === "CHARACTER" || i.layer === "MOUNT");
-    return items
-      .map((i) => `${i.name || "Unnamed"} at cell (${Math.round(i.position.x / dpi)}, ${Math.round(i.position.y / dpi)})`)
-      .join("\n");
+    const tokens = await readTokens();
+    const lines = tokens.map((t) => `${t.name}${t.side !== "pc" ? " [" + t.side + "]" : ""} at cell (${t.col}, ${t.row})`);
+    const layout = layoutText(savedMap());
+    return (layout ? layout + "\n" : "") + lines.join("\n");
   } catch (e) { return ""; }
 }
 
+/* ---------- player actions ---------- */
 async function say() {
   const text = input.value.trim();
   if (!text) return;
@@ -133,31 +227,191 @@ async function askDm() {
   await fetchLog();
 }
 
-let clearArmed = false;
-clearBtn.addEventListener("click", async () => {
-  if (!clearArmed) {
-    clearArmed = true; clearBtn.textContent = "Really clear?";
-    setTimeout(() => { clearArmed = false; clearBtn.textContent = "Clear story"; }, 4000);
-    return;
-  }
-  clearArmed = false; clearBtn.textContent = "Clear story";
-  try { await api("/api/clear", { room: roomId }); await fetchLog(); } catch (e) { add("sys", "Problem: " + e.message); }
-});
-
 sayBtn.addEventListener("click", say);
 askBtn.addEventListener("click", askDm);
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); say(); }
 });
 
+/* ---------- GM tools ---------- */
+const gmStatus = (t) => { $("gmstatus").textContent = t; };
+function busyBtn(btn, label, fn) {
+  btn.addEventListener("click", async () => {
+    const old = btn.textContent;
+    btn.disabled = true; btn.textContent = label;
+    try { await fn(); } catch (e) { gmStatus("Problem: " + e.message); }
+    btn.disabled = false; btn.textContent = old;
+  });
+}
+
+$("gmToggle").addEventListener("click", () => { $("story").hidden = true; $("gm").hidden = false; });
+$("gmBack").addEventListener("click", () => { $("gm").hidden = true; $("story").hidden = false; });
+
+busyBtn($("gmUnlock"), "Checking...", async () => {
+  store("gmcode", $("gmcode").value);
+  const d = await api(`/api/gm/brief?room=${encodeURIComponent(roomId)}`, null, true);
+  const local = store("brief-" + roomId) || "";
+  if (!d.brief && local) {
+    await api("/api/gm/brief", { room: roomId, brief: local }, true);
+    $("brief").value = local;
+    gmStatus("Unlocked. Your saved brief was restored to the server.");
+  } else {
+    $("brief").value = d.brief || "";
+    gmStatus("Unlocked.");
+  }
+  const m = savedMap();
+  if (m) $("legend").textContent = layoutText(m);
+});
+
+busyBtn($("draft"), "Drafting...", async () => {
+  const d = await api("/api/gm/oneshot", {
+    room: roomId, level: +$("lvl").value, players: +$("plr").value, theme: $("theme").value,
+  }, true);
+  $("brief").value = d.text;
+  gmStatus("Draft ready. Read it, edit it, then press Save brief.");
+});
+
+busyBtn($("saveBrief"), "Saving...", async () => {
+  const text = $("brief").value;
+  store("brief-" + roomId, text);
+  const d = await api("/api/gm/brief", { room: roomId, brief: text }, true);
+  gmStatus(`Brief saved (${d.length} characters). The DM will use it from the next Ask DM.`);
+});
+
+const FLOOR = { room: "#3a3f55", corridor: "#4a4f66", outdoor: "#3f5a3a", water: "#2f5d8a" };
+const THING = { pillar: "#8a8a99", door: "#a8742f", table: "#7a5a3a", statue: "#9a9aa8", water: "#3d78b5", hazard: "#b5483d", stairs: "#b9b9c9", tree: "#2f7a3a", chest: "#d4a72c", altar: "#8d5bb5" };
+
+async function drawMap(spec) {
+  if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room to draw the map.");
+  await ready;
+  const dpi = await getDpi();
+  const old = await OBR.scene.items.getItems((i) => i.metadata && i.metadata[GEN] === true);
+  if (old.length) await OBR.scene.items.deleteItems(old.map((i) => i.id));
+  const rect = (x, y, w, h, fill, stroke, name) =>
+    buildShape().width(w * dpi).height(h * dpi).shapeType("RECTANGLE")
+      .position({ x: x * dpi, y: y * dpi }).fillColor(fill).fillOpacity(1)
+      .strokeColor(stroke).strokeWidth(2).layer("MAP").name(name).locked(true)
+      .metadata({ [GEN]: true }).build();
+  const items = [rect(0, 0, spec.cols, spec.rows, "#15171f", "#15171f", spec.title)];
+  for (const a of spec.areas) items.push(rect(a.x, a.y, a.w, a.h, FLOOR[a.kind] || FLOOR.room, "#6b7090", a.name));
+  for (const f of spec.features) items.push(rect(f.x, f.y, f.w, f.h, THING[f.kind] || "#8a8a99", "#222", f.name));
+  await OBR.scene.items.addItems(items);
+  try {
+    await OBR.viewport.animateToBounds({ min: { x: 0, y: 0 }, max: { x: spec.cols * dpi, y: spec.rows * dpi } });
+  } catch (e) {}
+}
+
+busyBtn($("genMap"), "Designing...", async () => {
+  const d = await api("/api/gm/map", {
+    room: roomId, scene: $("scene").value, cols: +$("cols").value, rows: +$("rows").value,
+  }, true);
+  await drawMap(d.spec);
+  store("map-" + roomId, JSON.stringify(d.spec));
+  $("legend").textContent = layoutText(d.spec);
+  gmStatus("Map drawn. Cells are numbered from 0 at the top-left corner of the map.");
+});
+
+busyBtn($("spawn"), "Spawning...", async () => {
+  if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room to spawn tokens.");
+  await ready;
+  const dpi = await getDpi();
+  const name = $("tname").value.trim() || "Creature";
+  const count = Math.max(1, Math.min(12, +$("tcount").value || 1));
+  const col = +$("tcol").value || 0, row = +$("trow").value || 0, side = $("tside").value;
+  const color = { enemy: "#c0392b", npc: "#d4a72c", ally: "#2e86c1" }[side];
+  const items = [];
+  for (let n = 0; n < count; n++) {
+    const label = count > 1 ? `${name} ${n + 1}` : name;
+    const c = col + (n % 4), r = row + Math.floor(n / 4);
+    const shape = buildShape().width(dpi * (1 - 2 * OFF)).height(dpi * (1 - 2 * OFF)).shapeType("RECTANGLE")
+      .position({ x: (c + OFF) * dpi, y: (r + OFF) * dpi }).fillColor(color).fillOpacity(0.9)
+      .strokeColor("#ffffff").strokeWidth(3).layer("CHARACTER").name(label)
+      .metadata({ [SIDE]: side }).build();
+    const tag = buildLabel().plainText(label).position({ x: (c + 0.5) * dpi, y: r * dpi })
+      .attachedTo(shape.id).pointerDirection("DOWN").build();
+    items.push(shape, tag);
+  }
+  await OBR.scene.items.addItems(items);
+  gmStatus(`Spawned ${count} x ${name}.`);
+});
+
+function renderMoves() {
+  const box = $("moves");
+  box.innerHTML = "";
+  $("applyAll").hidden = pendingMoves.length < 2;
+  pendingMoves.forEach((m, idx) => {
+    const row = document.createElement("div");
+    row.className = "move";
+    const span = document.createElement("span");
+    span.textContent = `${tokenNames[m.id] || "Token"} to (${m.col}, ${m.row}): ${m.reason}`;
+    const b = document.createElement("button");
+    b.textContent = "Apply";
+    b.addEventListener("click", async () => {
+      try { await applyMoves([m]); pendingMoves.splice(idx, 1); renderMoves(); }
+      catch (e) { gmStatus("Problem: " + e.message); }
+    });
+    row.append(span, b);
+    box.appendChild(row);
+  });
+}
+
+async function applyMoves(moves) {
+  await ready;
+  const dpi = await getDpi();
+  const byId = {};
+  moves.forEach((m) => { byId[m.id] = m; });
+  await OBR.scene.items.updateItems(moves.map((m) => m.id), (items) => {
+    for (const it of items) {
+      const m = byId[it.id];
+      if (m) it.position = { x: (m.col + OFF) * dpi, y: (m.row + OFF) * dpi };
+    }
+  });
+}
+
+busyBtn($("suggest"), "Thinking...", async () => {
+  const tokens = await readTokens();
+  tokenNames = {};
+  tokens.forEach((t) => { tokenNames[t.id] = t.name; });
+  const m = savedMap();
+  const d = await api("/api/gm/moves", {
+    room: roomId, tokens, situation: $("situation").value,
+    layout: layoutText(m), cols: m ? m.cols : 40, rows: m ? m.rows : 30,
+  }, true);
+  pendingMoves = d.moves;
+  renderMoves();
+  gmStatus(d.moves.length ? (d.summary || "Moves suggested. Press Apply to make them.") : "The AI suggests no movement.");
+});
+
+$("applyAll").addEventListener("click", async () => {
+  try { await applyMoves(pendingMoves); pendingMoves = []; renderMoves(); gmStatus("All moves applied."); }
+  catch (e) { gmStatus("Problem: " + e.message); }
+});
+
+let clearArmed = false;
+$("clearBtn").addEventListener("click", async () => {
+  const b = $("clearBtn");
+  if (!clearArmed) {
+    clearArmed = true; b.textContent = "Really clear?";
+    setTimeout(() => { clearArmed = false; b.textContent = "Clear story"; }, 4000);
+    return;
+  }
+  clearArmed = false; b.textContent = "Clear story";
+  try { await api("/api/clear", { room: roomId }, true); gmStatus("Story cleared."); await fetchLog(); }
+  catch (e) { gmStatus("Problem: " + e.message); }
+});
+
+/* ---------- start ---------- */
 (async () => {
+  let isGm = !OBR.isAvailable; // outside Owlbear (testing) show GM tools
   try {
     if (OBR.isAvailable) {
       await ready;
       roomId = OBR.room.id || roomId;
       myName = (await OBR.player.getName()) || myName;
+      isGm = (await OBR.player.getRole()) === "GM";
     }
   } catch (e) {}
+  if (isGm) $("gmToggle").hidden = false;
   fetchLog();
   setInterval(fetchLog, 3000);
 })();
