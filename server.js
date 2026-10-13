@@ -26,14 +26,28 @@ const SYSTEM_PROMPT = `You are the Dungeon Master for a group of several players
 - When new enemies or NPCs appear, say clearly who and how many so the GM can place their tokens.
 - End scenes with a prompt like "What do you do?"`;
 
+const ART_KEY = process.env.POLLINATIONS_KEY || "";              // optional free key from enter.pollinations.ai
+
 async function fetchArt(prompt, w, h) {
-  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${w}&height=${h}&nologo=true&seed=${Math.floor(Math.random() * 1e6)}`;
+  const seed = Math.floor(Math.random() * 1e6);
+  const q = `width=${w}&height=${h}&seed=${seed}&model=flux`;
+  // With a key: the new API (uses your free daily "pollen"). Without: the old anonymous endpoint (watermark, slow).
+  const url = ART_KEY
+    ? `https://gen.pollinations.ai/image/${encodeURIComponent(prompt)}?${q}`
+    : `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${q}`;
+  const hdrs = ART_KEY ? { Authorization: "Bearer " + ART_KEY } : {};
   for (let attempt = 0; attempt < 2; attempt++) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 70000);
     try {
-      const resp = await fetch(url, { signal: ctrl.signal });
+      const resp = await fetch(url, { signal: ctrl.signal, headers: hdrs });
       if (resp.status === 429 && attempt === 0) { await new Promise((ok) => setTimeout(ok, 16000)); continue; }
+      if (resp.status === 402)
+        throw new Error(ART_KEY
+          ? "The image service says your free daily allowance is used up (402). Try again tomorrow."
+          : "The image service now wants an account for this (402). Add a free POLLINATIONS_KEY in Render (see the guide), or try again later.");
+      if (resp.status === 401 || resp.status === 403)
+        throw new Error("The image service rejected the POLLINATIONS_KEY (" + resp.status + "). Check it in Render.");
       if (!resp.ok) throw new Error("The image service answered " + resp.status + ".");
       const type = resp.headers.get("content-type") || "";
       if (!type.startsWith("image/")) throw new Error("The image service didn't return a picture.");
@@ -221,7 +235,7 @@ Schema: {"title": string, "cols": integer, "rows": integer,
  "creatures": [{"name": string, "count": int, "side": "enemy"|"npc"|"ally", "area": string}],
  "art": string}
 Rules:
-- "art": 10 to 20 words describing the ground and mood of the whole adventure as a top-down background texture (for example "mossy flooded flagstones, dark swamp ruin, faint torchlight"). No characters and no text.
+- "art": 8 to 16 words describing ONLY the floor surface and mood (materials, colors, lighting) as a seamless texture, for example "mossy cracked flagstones, shallow puddles, green swamp light". Never mention walls, rooms, buildings, doors, furniture, characters or text.
 - All numbers are whole grid cells (1 cell = 5 feet). x and y are the top-left cell, starting at 0. Everything must fit inside cols x rows.
 - "areas" are the walkable floor. Anything not covered by an area is solid rock or wall.
 - Lay out EVERY scene or location in the adventure notes, in story order, from one end of the map to the other. Name each main area after its scene or location (for example "Scene 1: Flooded Entry"). Link areas with corridors (kind "corridor", 2 cells wide) so everything is reachable.
@@ -394,10 +408,10 @@ async function handleApi(req, res, url, query) {
       const cols = clampInt(body.cols, 10, 60, 40), rows = clampInt(body.rows, 8, 45, 30);
       const w = 1280, h = Math.max(512, Math.min(1280, Math.round((1280 * rows) / cols)));
       const art = str(body.art, 200) || "ancient stone dungeon floor, faint torchlight";
-      const prompt = `top-down view, ${art}, painted fantasy battle map ground texture, rich detail, no characters, no text, no grid lines, no border`;
+      const prompt = `seamless tileable top-down floor texture, ${art}, flat even ground filling the whole image, painted fantasy style, no walls, no rooms, no buildings, no doors, no furniture, no characters, no text, no grid lines, no border, no perspective`;
       r.art = await fetchArt(prompt, w, h);
       r.artV += 1;
-      return json(res, 200, { url: `/art/${encodeURIComponent(r.id)}.jpg?v=${r.artV}` });
+      return json(res, 200, { url: `/art/${encodeURIComponent(r.id)}.jpg?v=${r.artV}`, mime: r.art.type.split(";")[0] });
     }
 
     if (url === "/api/gm/actions/resolve") {

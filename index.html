@@ -89,7 +89,7 @@
   <div class="line"><input type="text" id="notes" placeholder="Optional extra instructions (e.g. make it a ruined swamp temple)"></div>
   <div class="line">Cols <input type="number" id="cols" value="60" min="20" max="60"> Rows <input type="number" id="rows" value="40" min="15" max="45"><button id="build">Build map + monsters</button></div>
   <div class="line"><label><input type="checkbox" id="hideRooms" checked> Hide unexplored rooms until revealed</label></div>
-  <div class="line"><label><input type="checkbox" id="artOn" checked> Paint a background picture (free image service)</label><button id="addArt" class="alt">Add art to current map</button></div>
+  <div class="line"><label><input type="checkbox" id="artOn" checked> Paint floor art inside revealed rooms (free image service)</label><button id="addArt" class="alt">Add art to current map</button></div>
   <div id="legend"></div>
   <div id="rooms"></div>
 
@@ -125,6 +125,7 @@ const FOR = "com.aidm/for";
 const STORY = "com.aidm/story";
 const CAM = "com.aidm/camera";
 const LIGHT = "com.aidm/light";
+const MASK = "com.aidm/mask";
 const OFF = 0.05; // token inset, as a fraction of a cell
 
 let last = 0, roomId = "test-room", myName = "Player", lastErr = "", inflight = false, serverBusy = false, askBusy = false;
@@ -386,31 +387,53 @@ const imageSize = (url) => new Promise((ok, bad) => {
   i.src = url;
 });
 
+// Lines the art up exactly with the dark background rectangle, whatever Owlbear's position rules are.
+async function alignArt(artId, bgId) {
+  const fit = async () => {
+    const [bg, art] = [await OBR.scene.items.getItemBounds([bgId]), await OBR.scene.items.getItemBounds([artId])];
+    return { bg, art };
+  };
+  let { bg, art } = await fit();
+  if (art.width > 0 && art.height > 0 && (Math.abs(art.width - bg.width) > 1 || Math.abs(art.height - bg.height) > 1)) {
+    const fx = bg.width / art.width, fy = bg.height / art.height;
+    await OBR.scene.items.updateItems([artId], (items) => {
+      for (const it of items) it.scale = { x: it.scale.x * fx, y: it.scale.y * fy };
+    });
+    ({ bg, art } = await fit());
+  }
+  const dx = bg.min.x - art.min.x, dy = bg.min.y - art.min.y;
+  if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5)
+    await OBR.scene.items.updateItems([artId], (items) => {
+      for (const it of items) it.position = { x: it.position.x + dx, y: it.position.y + dy };
+    });
+}
+
 // Background (and optional painted art with a dark shade over it). Returns true if the art was used.
-async function drawBase(spec, artUrl) {
+async function drawBase(spec, art) {
   const dpi = await getDpi();
-  const items = [mapRect(dpi, 0, 0, spec.cols, spec.rows, "#15171f", "#15171f", spec.title, 0)];
-  let used = false;
-  if (artUrl) {
+  const bg = mapRect(dpi, 0, 0, spec.cols, spec.rows, "#15171f", "#15171f", spec.title, 0);
+  const items = [bg];
+  let artItem = null;
+  if (art && art.url) {
     try {
-      const { width, height } = await imageSize(artUrl);
-      const scale = (dpi * spec.cols) / width;
-      const art = buildImage({ url: artUrl, width, height, mime: "image/jpeg" }, { dpi, offset: { x: 0, y: 0 } })
-        .layer("MAP").scale({ x: scale, y: scale }).zIndex(1).locked(true).name("Map art")
-        .metadata({ [GEN]: true }).build();
-      items.push(art, mapRect(dpi, 0, 0, spec.cols, spec.rows, "#000000", "#000000", "Shade", 2, 0.55));
-      used = true;
-    } catch (e) { console.error(e); }
+      const { width, height } = await imageSize(art.url);
+      // The picture's own grid is set so its width covers exactly "cols" cells; then it is stretched to "rows" cells tall.
+      artItem = buildImage({ url: art.url, width, height, mime: art.mime || "image/jpeg" }, { dpi: width / spec.cols, offset: { x: 0, y: 0 } })
+        .layer("MAP").scale({ x: 1, y: (spec.rows * width) / (spec.cols * height) }).position({ x: 0, y: 0 })
+        .zIndex(1).locked(true).name("Map art").metadata({ [GEN]: true }).build();
+      items.push(artItem);
+    } catch (e) { console.error(e); artItem = null; }
   }
   await OBR.scene.items.addItems(items);
+  if (artItem) { try { await alignArt(artItem.id, bg.id); } catch (e) { console.error("align", e); } }
   try {
     await OBR.viewport.animateToBounds({ min: { x: 0, y: 0 }, max: { x: spec.cols * dpi, y: spec.rows * dpi }, width: spec.cols * dpi, height: spec.rows * dpi, center: { x: spec.cols * dpi / 2, y: spec.rows * dpi / 2 } });
   } catch (e) {}
-  return used;
+  return !!artItem;
 }
 
 function areaItems(dpi, spec, a, artOn) {
-  const items = [mapRect(dpi, a.x, a.y, a.w, a.h, FLOOR[a.kind] || FLOOR.room, "#6b7090", a.name, 3, artOn ? 0.5 : 1)];
+  const items = [mapRect(dpi, a.x, a.y, a.w, a.h, FLOOR[a.kind] || FLOOR.room, "#6b7090", a.name, 3, artOn ? 0.3 : 1)];
   for (const f of spec.features.filter((x) => featureOwner(spec, x) === a.name))
     items.push(mapRect(dpi, f.x, f.y, f.w, f.h, THING[f.kind] || "#8a8a99", "#222", f.name, 4, 1));
   return items;
@@ -418,7 +441,7 @@ function areaItems(dpi, spec, a, artOn) {
 
 async function getArt(spec) {
   const d = await api("/api/gm/art", { room: roomId, art: spec.art, cols: spec.cols, rows: spec.rows }, true);
-  return location.origin + d.url;
+  return { url: location.origin + d.url, mime: d.mime || "image/jpeg" };
 }
 
 /* ---- adventure state: map, creatures per room, which rooms are revealed (kept on this device) ---- */
@@ -444,6 +467,48 @@ async function syncAdv() {
   await api("/api/gm/state", { room: roomId, layout: layoutText(adv.spec), areas: adv.spec.areas.map((a) => a.name), revealed: adv.revealed }, true);
 }
 
+// Covers every cell that is NOT a revealed area with solid "rock", so the painted art only shows inside revealed rooms.
+// Rows of uncovered cells are merged into as few rectangles as possible.
+async function updateMask() {
+  const adv = advGet();
+  if (!adv || !OBR.isAvailable) return;
+  await ready;
+  const old = await OBR.scene.items.getItems((i) => i.metadata && i.metadata[MASK] === true);
+  if (old.length) await OBR.scene.items.deleteItems(old.map((i) => i.id));
+  if (!adv.art) return; // no art: the dark background already hides everything
+  const { cols, rows } = adv.spec;
+  const open = Array.from({ length: rows }, () => new Array(cols).fill(false));
+  for (const a of adv.spec.areas.filter((x) => adv.revealed.includes(x.name)))
+    for (let y = a.y; y < Math.min(rows, a.y + a.h); y++)
+      for (let x = a.x; x < Math.min(cols, a.x + a.w); x++) open[y][x] = true;
+  const rects = [], active = {};
+  for (let y = 0; y <= rows; y++) {
+    const runs = {};
+    if (y < rows) {
+      let x = 0;
+      while (x < cols) {
+        if (open[y][x]) { x++; continue; }
+        const x0 = x;
+        while (x < cols && !open[y][x]) x++;
+        runs[x0 + ":" + x] = true;
+      }
+    }
+    for (const k of Object.keys(active)) if (!runs[k]) { rects.push(active[k]); delete active[k]; }
+    for (const k of Object.keys(runs)) {
+      if (active[k]) active[k].h++;
+      else { const [x0, x1] = k.split(":").map(Number); active[k] = { x: x0, y, w: x1 - x0, h: 1 }; }
+    }
+  }
+  const dpi = await getDpi();
+  const items = rects.map((r) => {
+    const it = mapRect(dpi, r.x, r.y, r.w, r.h, "#15171f", "#15171f", "Rock", 2, 1);
+    it.metadata[MASK] = true;
+    it.disableHit = true;
+    return it;
+  });
+  for (let i = 0; i < items.length; i += 100) await OBR.scene.items.addItems(items.slice(i, i + 100));
+}
+
 // Draws a room (plus corridors touching it) and spawns the creatures that belong in it. Returns false if already visible.
 async function revealArea(name, quiet) {
   const adv = advGet();
@@ -467,7 +532,7 @@ async function revealArea(name, quiet) {
   await OBR.scene.items.addItems(items);
   await spawnTokens(spawns, true);
   advSet(adv);
-  if (!quiet) { try { await syncAdv(); } catch (e) {} renderRooms(); }
+  if (!quiet) { try { await updateMask(); } catch (e) { console.error("mask", e); } try { await syncAdv(); } catch (e) {} renderRooms(); }
   return true;
 }
 
@@ -506,6 +571,7 @@ function renderRooms() {
       all.disabled = true;
       try {
         for (const a of adv.spec.areas) await revealArea(a.name, true);
+        try { await updateMask(); } catch (e) {}
         try { await syncAdv(); } catch (e) {}
         renderRooms(); gmStatus("Everything is revealed.");
       } catch (e) { gmStatus("Problem: " + e.message); all.disabled = false; }
@@ -545,21 +611,22 @@ busyBtn($("build"), "Building...", async () => {
   const d = await api("/api/gm/build", {
     room: roomId, notes: $("notes").value, cols: +$("cols").value, rows: +$("rows").value,
   }, true);
-  let artUrl = "", artNote = "";
+  let art = null, artNote = "";
   if ($("artOn").checked) {
     gmStatus("Step 3 of 4: painting the background art (this can take up to a minute)...");
-    try { artUrl = await getArt(d.spec); } catch (e) { artNote = " The art was skipped: " + e.message; }
+    try { art = await getArt(d.spec); } catch (e) { artNote = " The art was skipped: " + e.message; }
   }
   gmStatus("Step 4 of 4: drawing the map...");
   try {
     await clearGenerated();
-    const used = await drawBase(d.spec, artUrl);
-    if (artUrl && !used) artNote = " The art picture could not be loaded.";
-    advSet({ spec: d.spec, tokens: d.tokens, revealed: [], art: used ? artUrl : "" });
+    const used = await drawBase(d.spec, art);
+    if (art && !used) artNote = " The art picture could not be loaded.";
+    advSet({ spec: d.spec, tokens: d.tokens, revealed: [], art: used ? art.url : "" });
     store("map-" + roomId, JSON.stringify(d.spec));
     const start = d.spec.areas.find((a) => a.kind !== "corridor") || d.spec.areas[0];
     if ($("hideRooms").checked) await revealArea(start.name, true);
     else for (const a of d.spec.areas) await revealArea(a.name, true);
+    await updateMask();
     await syncAdv();
   } catch (e) { throw new Error("Drawing failed: " + e.message); }
   const byArea = {};
@@ -578,15 +645,16 @@ busyBtn($("addArt"), "Painting...", async () => {
   if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room.");
   await ready;
   gmStatus("Painting the background art (this can take up to a minute)...");
-  const url = await getArt(adv.spec);
+  const art = await getArt(adv.spec);
   const old = await OBR.scene.items.getItems((i) => i.metadata && i.metadata[GEN] === true);
   if (old.length) await OBR.scene.items.deleteItems(old.map((i) => i.id));
-  adv.art = (await drawBase(adv.spec, url)) ? url : "";
+  adv.art = (await drawBase(adv.spec, art)) ? art.url : "";
   const dpi = await getDpi();
   const items = [];
   for (const a of adv.spec.areas.filter((x) => adv.revealed.includes(x.name))) items.push(...areaItems(dpi, adv.spec, a, !!adv.art));
   if (items.length) await OBR.scene.items.addItems(items);
   advSet(adv);
+  await updateMask();
   gmStatus(adv.art ? "Art added. Revealed rooms keep their creatures." : "The picture could not be loaded. The flat map was kept.");
 });
 
