@@ -181,7 +181,8 @@ OUTPUT FORMAT: reply with ONLY valid JSON: {"narration": string, "actions": [ ..
   {"type":"delete","name":"Goblin 2"}   (remove a defeated or departed creature; never a player character)
   {"type":"fog","on":true|false}   (true = cover the whole scene in fog, false = clear it)
   {"type":"camera","name":"Cult Leader"}  or  {"type":"camera","col":int,"row":int}   (focus everyone's view)
-  {"type":"light","name":"Ann","radius":4}   (give a token a light, radius in cells)`;
+  {"type":"light","name":"Ann","radius":4}   (give a token a light, radius in cells)
+  {"type":"reveal","area":"Scene 2: Altar Hall"}   (make a hidden area, and the creatures in it, appear on the map when the party reaches, opens or discovers it)`;
 
 function sanitizeActions(list) {
   const out = [];
@@ -198,6 +199,7 @@ function sanitizeActions(list) {
     else if (type === "camera" && (name || (isFinite(Number(a.col)) && isFinite(Number(a.row)))))
       out.push({ type, name, col: clampInt(a.col, 0, 200, 0), row: clampInt(a.row, 0, 200, 0) });
     else if (type === "light" && name) out.push({ type, name, radius: clampInt(a.radius, 1, 12, 3) });
+    else if (type === "reveal" && str(a.area, 60)) out.push({ type, area: str(a.area, 60) });
   }
   return out;
 }
@@ -206,7 +208,7 @@ function sanitizeActions(list) {
 const rooms = {};
 function getRoom(id) {
   id = String(id || "default").slice(0, 100);
-  if (!rooms[id]) rooms[id] = { msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1 };
+  if (!rooms[id]) rooms[id] = { msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1, adv: null };
   return rooms[id];
 }
 function addMsg(r, role, who, text) {
@@ -297,6 +299,13 @@ function briefBlock(r) {
   return r.brief
     ? "\n\nSECRET DM NOTES (players must not see these. Never quote them. Reveal information only through play, when the players earn it):\n" + r.brief
     : "";
+}
+function advBlock(r) {
+  if (!r.adv) return "";
+  const rev = r.adv.revealed, hid = r.adv.areas.filter((n) => !rev.includes(n));
+  return "\n\nMAP LAYOUT: " + r.adv.layout +
+    "\nAreas players can see: " + (rev.join("; ") || "none") +
+    "\nHidden areas (players have not found these yet; do not describe their contents as if seen): " + (hid.join("; ") || "none");
 }
 function recentStory(r, n) {
   return r.msgs.slice(-n).map((m) => (m.role === "dm" ? "DM: " : m.who + ": ") + m.text).join("\n");
@@ -441,7 +450,7 @@ async function handleApi(req, res, url, query) {
       r.busy = true;
       try {
         const raw = await gemini({
-          system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
+          system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + advBlock(r) + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
           contents: buildContents(r.msgs),
           json: true,
           maxTokens: 4096,
@@ -489,6 +498,12 @@ async function handleApi(req, res, url, query) {
     if (url === "/api/gm/brief") {
       r.brief = str(body.brief, 12000);
       return json(res, 200, { ok: true, length: r.brief.length });
+    }
+
+    if (url === "/api/gm/state") {
+      const names = (v) => (Array.isArray(v) ? v : []).slice(0, 40).map((x) => str(x, 60)).filter(Boolean);
+      r.adv = { layout: str(body.layout, 4000), areas: names(body.areas), revealed: names(body.revealed) };
+      return json(res, 200, { ok: true });
     }
 
     if (url === "/api/gm/actions/resolve") {
@@ -639,6 +654,9 @@ http.createServer((req, res) => {
   #actions .arow { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
   #actions .arow span { flex: 1; }
   #actions button { height: 28px; font-size: 12px; }
+  #rooms .rrow { display: flex; gap: 6px; align-items: center; margin: 3px 0; font-size: 13px; }
+  #rooms .rrow span { flex: 1; }
+  #rooms button { height: 26px; font-size: 12px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -683,7 +701,9 @@ http.createServer((req, res) => {
   <div class="hint">Reads your saved brief, draws the whole adventure as one connected map, then places every monster and NPC from the brief in its room. Save the brief first. Pressing again replaces the previous generated map and creatures.</div>
   <div class="line"><input type="text" id="notes" placeholder="Optional extra instructions (e.g. make it a ruined swamp temple)"></div>
   <div class="line">Cols <input type="number" id="cols" value="60" min="20" max="60"> Rows <input type="number" id="rows" value="40" min="15" max="45"><button id="build">Build map + monsters</button></div>
+  <div class="line"><label><input type="checkbox" id="hideRooms" checked> Hide unexplored rooms until revealed</label></div>
   <div id="legend"></div>
+  <div id="rooms"></div>
 
   <h4>3. Add one more creature (optional)</h4>
   <div class="hint">For anything the brief missed. Tokens made here can also be moved by the AI's suggestions. Col and Row are grid cells.</div>
@@ -872,9 +892,12 @@ function layoutText(m) {
 async function mapContext() {
   try {
     const tokens = await readTokens();
-    const lines = tokens.map((t) => `${t.name}${t.side !== "pc" ? " [" + t.side + "]" : ""} at cell (${t.col}, ${t.row})`);
-    const layout = layoutText(savedMap());
-    return (layout ? layout + "\n" : "") + lines.join("\n");
+    let extra = "";
+    try { await ready; extra += `Fog: ${(await OBR.scene.fog.getFilled()) ? "on (whole scene covered)" : "off"}\n`; } catch (e) {}
+    const lit = tokens.filter((t) => lights[t.id]).map((t) => t.name);
+    if (lit.length) extra += `Lit tokens: ${lit.join(", ")}\n`;
+    const lines = tokens.map((t) => `${t.name}${t.side !== "pc" ? " [" + t.side + "]" : " [player]"} at cell (${t.col}, ${t.row})`);
+    return extra + lines.join("\n");
   } catch (e) { return ""; }
 }
 
@@ -933,6 +956,7 @@ busyBtn($("gmUnlock"), "Checking...", async () => {
   }
   const m = savedMap();
   if (m) $("legend").textContent = layoutText(m);
+  if (advGet()) { renderRooms(); try { await syncAdv(); } catch (e) {} }
 });
 
 busyBtn($("draft"), "Drafting...", async () => {
@@ -960,20 +984,114 @@ async function clearGenerated() {
   if (old.length) await OBR.scene.items.deleteItems(old.map((i) => i.id));
 }
 
-async function drawMap(spec) {
+function mapRect(dpi, x, y, w, h, fill, stroke, name, z) {
+  return buildShape().width(w * dpi).height(h * dpi).shapeType("RECTANGLE")
+    .position({ x: x * dpi, y: y * dpi }).fillColor(fill).fillOpacity(1)
+    .strokeColor(stroke).strokeWidth(2).layer("MAP").name(name).zIndex(z).locked(true)
+    .metadata({ [GEN]: true }).build();
+}
+
+async function drawBase(spec) {
   const dpi = await getDpi();
-  const rect = (x, y, w, h, fill, stroke, name) =>
-    buildShape().width(w * dpi).height(h * dpi).shapeType("RECTANGLE")
-      .position({ x: x * dpi, y: y * dpi }).fillColor(fill).fillOpacity(1)
-      .strokeColor(stroke).strokeWidth(2).layer("MAP").name(name).locked(true)
-      .metadata({ [GEN]: true }).build();
-  const items = [rect(0, 0, spec.cols, spec.rows, "#15171f", "#15171f", spec.title)];
-  for (const a of spec.areas) items.push(rect(a.x, a.y, a.w, a.h, FLOOR[a.kind] || FLOOR.room, "#6b7090", a.name));
-  for (const f of spec.features) items.push(rect(f.x, f.y, f.w, f.h, THING[f.kind] || "#8a8a99", "#222", f.name));
-  await OBR.scene.items.addItems(items);
+  await OBR.scene.items.addItems([mapRect(dpi, 0, 0, spec.cols, spec.rows, "#15171f", "#15171f", spec.title, 0)]);
   try {
-    await OBR.viewport.animateToBounds({ min: { x: 0, y: 0 }, max: { x: spec.cols * dpi, y: spec.rows * dpi } });
+    await OBR.viewport.animateToBounds({ min: { x: 0, y: 0 }, max: { x: spec.cols * dpi, y: spec.rows * dpi }, width: spec.cols * dpi, height: spec.rows * dpi, center: { x: spec.cols * dpi / 2, y: spec.rows * dpi / 2 } });
   } catch (e) {}
+}
+
+/* ---- adventure state: map, creatures per room, which rooms are revealed (kept on this device) ---- */
+const advKey = () => "adv-" + roomId;
+function advGet() { try { return JSON.parse(store(advKey()) || "null"); } catch (e) { return null; } }
+function advSet(a) { store(advKey(), JSON.stringify(a)); }
+const touches = (c, a) => c.x < a.x + a.w + 1 && c.x + c.w > a.x - 1 && c.y < a.y + a.h + 1 && c.y + c.h > a.y - 1;
+function featureOwner(spec, f) {
+  const cx = f.x + f.w / 2, cy = f.y + f.h / 2;
+  const inside = spec.areas.find((a) => cx >= a.x && cx <= a.x + a.w && cy >= a.y && cy <= a.y + a.h);
+  if (inside) return inside.name;
+  let best = spec.areas[0], bd = Infinity;
+  for (const a of spec.areas) {
+    const d = Math.hypot(cx - (a.x + a.w / 2), cy - (a.y + a.h / 2));
+    if (d < bd) { bd = d; best = a; }
+  }
+  return best.name;
+}
+
+async function syncAdv() {
+  const adv = advGet();
+  if (!adv) return;
+  await api("/api/gm/state", { room: roomId, layout: layoutText(adv.spec), areas: adv.spec.areas.map((a) => a.name), revealed: adv.revealed }, true);
+}
+
+// Draws a room (plus corridors touching it) and spawns the creatures that belong in it. Returns false if already visible.
+async function revealArea(name, quiet) {
+  const adv = advGet();
+  if (!adv) throw new Error("There is no generated map yet. Press Build map + monsters first.");
+  await ready;
+  const low = (s) => String(s).toLowerCase();
+  const spec = adv.spec;
+  const target = spec.areas.find((a) => low(a.name) === low(name)) ||
+    spec.areas.find((a) => low(a.name).includes(low(name)) || low(name).includes(low(a.name)));
+  if (!target) throw new Error(`There is no area named "${name}".`);
+  const group = [target, ...(target.kind !== "corridor" ? spec.areas.filter((c) => c.kind === "corridor" && touches(c, target)) : [])]
+    .filter((a) => !adv.revealed.includes(a.name));
+  if (!group.length) return false;
+  const dpi = await getDpi();
+  const items = [], spawns = [];
+  for (const a of group) {
+    items.push(mapRect(dpi, a.x, a.y, a.w, a.h, FLOOR[a.kind] || FLOOR.room, "#6b7090", a.name, 2));
+    for (const f of spec.features.filter((x) => featureOwner(spec, x) === a.name))
+      items.push(mapRect(dpi, f.x, f.y, f.w, f.h, THING[f.kind] || "#8a8a99", "#222", f.name, 3));
+    spawns.push(...adv.tokens.filter((t) => t.area === a.name));
+    adv.revealed.push(a.name);
+  }
+  await OBR.scene.items.addItems(items);
+  await spawnTokens(spawns, true);
+  advSet(adv);
+  if (!quiet) { try { await syncAdv(); } catch (e) {} renderRooms(); }
+  return true;
+}
+
+function renderRooms() {
+  const box = $("rooms");
+  box.innerHTML = "";
+  const adv = advGet();
+  if (!adv) return;
+  const title = document.createElement("div");
+  title.textContent = "Rooms";
+  title.style.cssText = "margin-top:8px;color:#f1e3b0";
+  box.appendChild(title);
+  adv.spec.areas.filter((a) => a.kind !== "corridor").forEach((a) => {
+    const row = document.createElement("div");
+    row.className = "rrow";
+    const span = document.createElement("span");
+    const seen = adv.revealed.includes(a.name);
+    span.textContent = (seen ? "\u2713 " : "\u25CB ") + a.name;
+    row.appendChild(span);
+    if (!seen) {
+      const b = document.createElement("button");
+      b.textContent = "Reveal";
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        try { await revealArea(a.name); gmStatus(`Revealed ${a.name}.`); } catch (e) { gmStatus("Problem: " + e.message); b.disabled = false; }
+      });
+      row.appendChild(b);
+    }
+    box.appendChild(row);
+  });
+  if (adv.spec.areas.some((a) => a.kind !== "corridor" && !adv.revealed.includes(a.name))) {
+    const all = document.createElement("button");
+    all.textContent = "Reveal all rooms";
+    all.className = "alt";
+    all.addEventListener("click", async () => {
+      all.disabled = true;
+      try {
+        for (const a of adv.spec.areas) await revealArea(a.name, true);
+        try { await syncAdv(); } catch (e) {}
+        renderRooms(); gmStatus("Everything is revealed.");
+      } catch (e) { gmStatus("Problem: " + e.message); all.disabled = false; }
+    });
+    box.appendChild(all);
+  }
 }
 
 async function spawnTokens(list, auto) {
@@ -1010,15 +1128,22 @@ busyBtn($("build"), "Building...", async () => {
   gmStatus("Step 3 of 3: drawing the map...");
   try {
     await clearGenerated();
-    await drawMap(d.spec);
-    await spawnTokens(d.tokens, true);
+    await drawBase(d.spec);
+    advSet({ spec: d.spec, tokens: d.tokens, revealed: [] });
+    store("map-" + roomId, JSON.stringify(d.spec));
+    const start = d.spec.areas.find((a) => a.kind !== "corridor") || d.spec.areas[0];
+    if ($("hideRooms").checked) await revealArea(start.name, true);
+    else for (const a of d.spec.areas) await revealArea(a.name, true);
+    await syncAdv();
   } catch (e) { throw new Error("Drawing failed: " + e.message); }
-  store("map-" + roomId, JSON.stringify(d.spec));
   const byArea = {};
   d.tokens.forEach((t) => { (byArea[t.area] = byArea[t.area] || []).push(t.name); });
-  $("legend").textContent = layoutText(d.spec) + "\n\nCreatures placed:\n" +
+  $("legend").textContent = layoutText(d.spec) + "\n\nCreatures by room (they appear when the room is revealed):\n" +
     (Object.keys(byArea).map((a) => `${a}: ${byArea[a].join(", ")}`).join("\n") || "none");
-  gmStatus(`Done. Built ${d.spec.areas.length} areas and ${d.tokens.length} creatures. If you can't see the map, zoom out in Owlbear.`);
+  renderRooms();
+  gmStatus($("hideRooms").checked
+    ? `Done. Only the first room is visible. ${d.spec.areas.length} areas and ${d.tokens.length} creatures are ready; reveal rooms below or let the DM propose it.`
+    : `Done. Built ${d.spec.areas.length} areas and ${d.tokens.length} creatures. If you can't see the map, zoom out in Owlbear.`);
 });
 
 busyBtn($("spawn"), "Spawning...", async () => {
@@ -1114,6 +1239,7 @@ function describe(a) {
   if (a.type === "delete") return `Remove ${a.name}`;
   if (a.type === "fog") return a.on ? "Cover the scene in fog" : "Clear the fog";
   if (a.type === "light") return `Give ${a.name} a light (${a.radius} cells)`;
+  if (a.type === "reveal") return `Reveal "${a.area}" on the map`;
   return a.type;
 }
 
@@ -1189,6 +1315,8 @@ async function runAction(a) {
     const ids = targets.map((t) => t.id);
     const labels = await OBR.scene.items.getItems((i) => i.metadata && ids.includes(i.metadata[FOR]));
     await OBR.scene.items.deleteItems([...ids, ...labels.map((l) => l.id)]);
+  } else if (a.type === "reveal") {
+    if (!(await revealArea(a.area))) throw new Error(`"${a.area}" is already revealed.`);
   } else if (a.type === "fog") {
     await OBR.scene.fog.setFilled(!!a.on);
   } else if (a.type === "camera") {
@@ -1305,3 +1433,10 @@ async function handleActions(list) {
 - Step 3 DONE (untested live): Ask DM now uses Gemini JSON mode returning `{narration, actions[]}`; server sanitizes actions (spawn, move, delete, fog, camera, light; max 6) and queues them in `room.pending`; only requests with the GM code receive them in `/api/log`; GM panel shows an approval card (Approve / Skip / Approve all / Skip all); `/api/gm/actions/resolve` clears them. Camera actions auto-run and are broadcast to everyone with `OBR.broadcast.sendMessage("com.aidm/camera", ..., {destination:"ALL"})` (players can untick "follow DM camera"). Lights are broadcast so every client adds a local `buildLight()` (lights are local-only items). If JSON parsing fails, the raw reply is shown as narration with no actions.
 - UNVERIFIED in a live room: `OBR.broadcast` API shape, light visibility (may need Owlbear dynamic fog), shape position origin (their code treats shapes as center-positioned; ours assume top-left), fog `setFilled`.
 - Still to do from the list: Step 4 finer fog (reveal by room; needs FOG-layer items, unverified), Step 5 richer scene awareness (fog and lights in the snapshot), Step 6 SSE + synced camera polish, Step 7 map art on the map layer (provider test pending: user should test the Pollinations URL).
+
+## 14. Progress: Steps 1 and 2 of the "next steps" list built (v0.4), user test results
+- User tested: Steps 2 and 3 of the earlier plan PASSED (saved history survives a Render restart; AI action approval works). Pollinations test URL returned an image with a watermark in the lower right (user is OK with the watermark). User set MODEL (Flash-Lite) and PLAN_MODEL (gemini-3.8-flash).
+- Item 1 DONE (untested live): the Ask DM map snapshot now includes fog status (`OBR.scene.fog.getFilled()`), tokens that have lights, and each token tagged [player] or [enemy|npc|ally] with cell positions. The map layout and room visibility now come from the SERVER.
+- Item 2 DONE (untested live): **hidden rooms**. Build map + monsters draws only a dark background plus the first non-corridor room (and corridors touching it) when "Hide unexplored rooms" is ticked; other rooms and their creatures are NOT drawn/spawned until revealed. Reveal happens via the GM's Rooms list (Reveal / Reveal all) or an AI action `{"type":"reveal","area":"<room name>"}` that the GM approves. Revealing a room draws its floor (zIndex 2), the features it owns (zIndex 3), touching corridors, and spawns its creatures (tagged AUTO). The adventure state (spec, creatures per room, revealed list) is kept in the GM browser's localStorage key `adv-<roomId>` and mirrored to the server with `POST /api/gm/state` (GM code) so the DM prompt includes MAP LAYOUT, areas players can see, and hidden areas. State is re-sent on Unlock after a server restart. Limitation: reveal only works from the GM's browser/device that holds the saved state.
+- Design note: we hide rooms by not drawing them (no layer-order or fog-layer assumptions needed), so there is no "cover" shape and the GM also cannot see hidden rooms on the board (they appear in the Rooms list and legend).
+- Remaining: Item 3 map art on the map layer (image source: Pollinations legacy endpoint works for the user with a watermark; need server-side fetch + hosting + `buildImage` insertion), Item 4 polish (move Access code box into GM tools, SSE instead of polling, refresh setup guide).

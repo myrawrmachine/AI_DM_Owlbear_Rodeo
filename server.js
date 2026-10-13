@@ -38,7 +38,8 @@ OUTPUT FORMAT: reply with ONLY valid JSON: {"narration": string, "actions": [ ..
   {"type":"delete","name":"Goblin 2"}   (remove a defeated or departed creature; never a player character)
   {"type":"fog","on":true|false}   (true = cover the whole scene in fog, false = clear it)
   {"type":"camera","name":"Cult Leader"}  or  {"type":"camera","col":int,"row":int}   (focus everyone's view)
-  {"type":"light","name":"Ann","radius":4}   (give a token a light, radius in cells)`;
+  {"type":"light","name":"Ann","radius":4}   (give a token a light, radius in cells)
+  {"type":"reveal","area":"Scene 2: Altar Hall"}   (make a hidden area, and the creatures in it, appear on the map when the party reaches, opens or discovers it)`;
 
 function sanitizeActions(list) {
   const out = [];
@@ -55,6 +56,7 @@ function sanitizeActions(list) {
     else if (type === "camera" && (name || (isFinite(Number(a.col)) && isFinite(Number(a.row)))))
       out.push({ type, name, col: clampInt(a.col, 0, 200, 0), row: clampInt(a.row, 0, 200, 0) });
     else if (type === "light" && name) out.push({ type, name, radius: clampInt(a.radius, 1, 12, 3) });
+    else if (type === "reveal" && str(a.area, 60)) out.push({ type, area: str(a.area, 60) });
   }
   return out;
 }
@@ -63,7 +65,7 @@ function sanitizeActions(list) {
 const rooms = {};
 function getRoom(id) {
   id = String(id || "default").slice(0, 100);
-  if (!rooms[id]) rooms[id] = { msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1 };
+  if (!rooms[id]) rooms[id] = { msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1, adv: null };
   return rooms[id];
 }
 function addMsg(r, role, who, text) {
@@ -154,6 +156,13 @@ function briefBlock(r) {
   return r.brief
     ? "\n\nSECRET DM NOTES (players must not see these. Never quote them. Reveal information only through play, when the players earn it):\n" + r.brief
     : "";
+}
+function advBlock(r) {
+  if (!r.adv) return "";
+  const rev = r.adv.revealed, hid = r.adv.areas.filter((n) => !rev.includes(n));
+  return "\n\nMAP LAYOUT: " + r.adv.layout +
+    "\nAreas players can see: " + (rev.join("; ") || "none") +
+    "\nHidden areas (players have not found these yet; do not describe their contents as if seen): " + (hid.join("; ") || "none");
 }
 function recentStory(r, n) {
   return r.msgs.slice(-n).map((m) => (m.role === "dm" ? "DM: " : m.who + ": ") + m.text).join("\n");
@@ -298,7 +307,7 @@ async function handleApi(req, res, url, query) {
       r.busy = true;
       try {
         const raw = await gemini({
-          system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
+          system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + advBlock(r) + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
           contents: buildContents(r.msgs),
           json: true,
           maxTokens: 4096,
@@ -346,6 +355,12 @@ async function handleApi(req, res, url, query) {
     if (url === "/api/gm/brief") {
       r.brief = str(body.brief, 12000);
       return json(res, 200, { ok: true, length: r.brief.length });
+    }
+
+    if (url === "/api/gm/state") {
+      const names = (v) => (Array.isArray(v) ? v : []).slice(0, 40).map((x) => str(x, 60)).filter(Boolean);
+      r.adv = { layout: str(body.layout, 4000), areas: names(body.areas), revealed: names(body.revealed) };
+      return json(res, 200, { ok: true });
     }
 
     if (url === "/api/gm/actions/resolve") {
