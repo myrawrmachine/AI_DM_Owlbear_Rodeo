@@ -96,7 +96,7 @@ No LICENSE file is in the ZIP, so do NOT copy their code or art assets. Use it o
 **Implications for our steps:** Step 2 (history): store a TRIMMED copy in room metadata (their unbounded array is a known risk); never store the brief there. Step 3 (actions): use their action list as the checklist, run with GM approval, bundled in the Ask DM request. Step 4 (fog): only whole-scene fog on/off and token lights are proven; fine-grained reveals need FOG-layer items, unverified. Step 7 (map art): `insertMap` approach is proven; we still need a free image source and hosting.
 
 ## 7. Full source code (current)
-Create each file with exactly these contents (current version: v0.6.0). `icon.svg` and `package.json` are unchanged since the first version.
+Create each file with exactly these contents (current version: v0.6.1). `icon.svg` and `package.json` are unchanged since the first version.
 
 ### package.json
 
@@ -116,7 +116,7 @@ Create each file with exactly these contents (current version: v0.6.0). `icon.sv
 ```json
 {
   "name": "AI Dungeon Master",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "manifest_version": 1,
   "description": "An AI DM that narrates, drafts one-shots, draws maps and suggests enemy moves.",
   "author": "You",
@@ -214,6 +214,9 @@ OUTPUT FORMAT: reply with ONLY valid JSON: {"narration": string, "actions": [ ..
 - "narration" is what you say to the players (markdown allowed). Never reveal secret notes in it.
 - "actions" is optional (use [] when nothing is needed). The GM approves actions before anything happens, so only propose them when the story clearly calls for it. At most 6.
 - Use grid cells from the map snapshot (col and row start at 0 in the top-left).
+- For move, delete, camera and light, use a token's EXACT name from the map snapshot (for example "Goblin Warrior 2").
+- Do NOT spawn creatures that are already on the map snapshot, and do NOT spawn the creatures of a hidden area: they appear automatically when that area is revealed, so use "reveal" instead. Only spawn genuinely new arrivals (reinforcements, summons, a newly introduced NPC).
+- Never move a creature onto a cell that another token occupies.
 - Action types:
   {"type":"spawn","name":"Goblin","count":3,"side":"enemy"|"npc"|"ally","col":int,"row":int}   (creatures that enter the scene now)
   {"type":"move","name":"Goblin 1","col":int,"row":int,"reason":"short"}   (only enemy/npc/ally tokens, never player characters)
@@ -230,7 +233,7 @@ function sanitizeActions(list) {
     const type = str(a.type, 12);
     const name = str(a.name, 40);
     if (type === "spawn" && name)
-      out.push({ type, name, count: clampInt(a.count, 1, 12, 1), side: ["enemy", "npc", "ally"].includes(a.side) ? a.side : "enemy", col: clampInt(a.col, 0, 200, 0), row: clampInt(a.row, 0, 200, 0) });
+      out.push({ type, name: baseName(name) || name, count: clampInt(a.count, 1, 12, 1), side: ["enemy", "npc", "ally"].includes(a.side) ? a.side : "enemy", col: clampInt(a.col, 0, 200, 0), row: clampInt(a.row, 0, 200, 0) });
     else if (type === "move" && name)
       out.push({ type, name, col: clampInt(a.col, 0, 200, 0), row: clampInt(a.row, 0, 200, 0), reason: str(a.reason, 80) });
     else if (type === "delete" && name) out.push({ type, name });
@@ -326,10 +329,26 @@ async function gemini({ system, contents, json: wantJson, model, maxTokens }) {
       throw new Error("The free AI quota is used up for the moment. Wait a minute (or until tomorrow if it's the daily cap) and try again.");
     throw new Error("AI error: " + ((data.error && data.error.message) || resp.status));
   }
-  const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
-  const text = (parts || []).map((p) => p.text || "").join("").trim();
-  if (!text) throw new Error("The AI returned an empty answer (it may have been blocked). Try rephrasing.");
+  const cand = data.candidates && data.candidates[0];
+  const parts = cand && cand.content && cand.content.parts;
+  const text = (parts || []).filter((p) => !p.thought).map((p) => p.text || "").join("").trim();
+  const cut = cand && cand.finishReason === "MAX_TOKENS";
+  if (!text) throw new Error(cut ? "The AI ran out of room before answering. Please try again." : "The AI returned an empty answer (it may have been blocked). Try rephrasing.");
+  if (cut && wantJson) { const e = new Error("cut off"); e.cutOff = true; e.text = text; throw e; }
   return text;
+}
+// Asks for JSON and, if the answer comes back cut off or malformed, asks once more (costs one extra request).
+async function geminiJson(opts) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const sys = attempt ? opts.system + "\n\nIMPORTANT: your previous answer was cut off or was not valid JSON. Reply again with complete, valid JSON only, and keep descriptions short." : opts.system;
+    try {
+      return parseJson(await gemini({ ...opts, system: sys, json: true }));
+    } catch (e) {
+      if (attempt === 0 && (e.cutOff || /expected format/.test(e.message))) { console.log("Retrying malformed AI JSON"); continue; }
+      if (e.cutOff) throw new Error("The AI's answer was too long and got cut off. Try again, or make the map smaller (fewer Cols/Rows).");
+      throw e;
+    }
+  }
 }
 function parseJson(t) {
   t = t.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
@@ -507,8 +526,8 @@ Rules:
 - All numbers are whole grid cells (1 cell = 5 feet). x and y are the top-left cell, starting at 0. Everything must fit inside cols x rows.
 - "areas" are the walkable floor. Anything not covered by an area is solid rock or wall.
 - Lay out EVERY scene or location in the adventure notes, in story order, from one end of the map to the other. Name each main area after its scene or location (for example "Scene 1: Flooded Entry"). Link areas with corridors (kind "corridor", 2 cells wide) so everything is reachable.
-- Use 6 to 16 areas. Rooms should be at least 5x5 cells, and big encounter rooms 8x8 or larger. Leave empty space between rooms.
-- Put "features" inside areas: cover, hazards, doors at area edges, and interesting objects that fit the story. Use 10 to 40 features. Keep each 1 to 3 cells.
+- Use 6 to 14 areas. Rooms should be at least 5x5 cells, and big encounter rooms 8x8 or larger. Leave empty space between rooms.
+- Put "features" inside areas: cover, hazards, doors at area edges, and interesting objects that fit the story. Use 10 to 30 features. Keep every name short (under 5 words). Keep each 1 to 3 cells.
 - "creatures": include EVERY monster and NPC from the notes, in the area where the party meets them. Use the exact area name. Use the counts in the notes (maximum 12 per entry). Give the creature name without numbers. Use the official D&D 2024 (SRD 5.2) monster name when one fits (for example "Goblin Warrior", "Bandit", "Skeleton", "Cultist"), so the creature's official stats can be looked up. Leave out the player characters.`;
 
 const MOVES_SYSTEM = `You control the enemies and NPCs in a tabletop D&D (2024, 5.5e) combat. Output ONLY valid JSON, no commentary.
@@ -618,12 +637,18 @@ async function handleApi(req, res, url, query) {
       notify(r);
       try {
         const stats = await statsBlock(creatureNames(r, body.creatures));
-        const raw = await gemini({
+        let raw;
+        try {
+          raw = await gemini({
           system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + advBlock(r) + stats + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
           contents: buildContents(r.msgs),
           json: true,
-          maxTokens: 4096,
+          maxTokens: 6144,
         });
+        } catch (e) {
+          if (!e.cutOff) throw e;
+          raw = e.text; // cut off near the end: keep whatever story text arrived
+        }
         let narration = raw, actions = [];
         try {
           const p = parseJson(raw);
@@ -631,7 +656,11 @@ async function handleApi(req, res, url, query) {
             narration = p.narration.trim();
             actions = sanitizeActions(p.actions);
           }
-        } catch (e) {}
+        } catch (e) {
+          // Broken JSON: pull out just the story text so players never see raw code.
+          const m = raw.match(/"narration"\s*:\s*"((?:[^"\\]|\\.)*)/);
+          if (m) { try { narration = JSON.parse('"' + m[1] + '"'); } catch (x) { narration = m[1].replace(/\\n/g, "\n").replace(/\\"/g, '"'); } }
+        }
         addMsg(r, "dm", "DM", narration);
         actions.forEach((a) => r.pending.push({ id: r.aseq++, ...a }));
         r.pending = r.pending.slice(-30);
@@ -725,17 +754,15 @@ async function handleApi(req, res, url, query) {
       const cols = clampInt(body.cols, 20, 60, 60);
       const rows = clampInt(body.rows, 15, 45, 40);
       const notes = str(body.notes, 500);
-      const t = await gemini({
+      const parsed = await geminiJson({
         model: PLAN_MODEL,
-        json: true,
-        maxTokens: 8192,
+        maxTokens: 16384,
         system: MAP_SYSTEM,
         contents: one(
           `Map size: cols=${cols}, rows=${rows}.\n` + (notes ? `Extra instructions from the GM: ${notes}\n` : "") +
           `\nADVENTURE NOTES:\n${r.brief.slice(0, 9000)}`
         ),
       });
-      const parsed = parseJson(t);
       const spec = sanitizeMap({ ...parsed, cols, rows });
       if (!spec.areas.length) throw new Error("The AI didn't produce any rooms. Please try again.");
       const tokens = placeCreatures(spec, parsed.creatures);
@@ -754,9 +781,9 @@ async function handleApi(req, res, url, query) {
       const rows = clampInt(body.rows, 8, 200, 30);
       const situation = str(body.situation, 500);
       const stats = await statsBlock(creatureNames(r, movable.map((k) => k.name)), 5000);
-      const t = await gemini({
+      const parsed = await geminiJson({
         model: PLAN_MODEL,
-        json: true,
+        maxTokens: 4096,
         system: MOVES_SYSTEM,
         contents: one(
           (str(body.layout, 4000) ? `${str(body.layout, 4000)}\n\n` : "") +
@@ -765,7 +792,6 @@ async function handleApi(req, res, url, query) {
           `\n\nRecent story:\n${recentStory(r, 8)}` + briefBlock(r) + stats
         ),
       });
-      const parsed = parseJson(t);
       const ids = new Set(movable.map((k) => k.id));
       const moves = (Array.isArray(parsed.moves) ? parsed.moves : [])
         .filter((m) => ids.has(m.id))
@@ -1139,8 +1165,8 @@ async function readTokens() {
     id: i.id,
     name: i.name || "Unnamed",
     side: (i.metadata && i.metadata[SIDE]) || "pc",
-    col: Math.round(i.position.x / dpi),
-    row: Math.round(i.position.y / dpi),
+    col: Math.floor(i.position.x / dpi),
+    row: Math.floor(i.position.y / dpi),
   }));
 }
 
@@ -1580,9 +1606,41 @@ function renderMoves() {
   });
 }
 
+const BLOCK_KINDS = new Set(["pillar", "statue", "table", "water", "tree", "altar", "chest"]);
+// Cells a creature may stand on: inside a revealed area and not on a blocking feature. null = no built map (anything goes).
+function walkableCells() {
+  const adv = advGet();
+  if (!adv || !adv.spec) return null;
+  const ok = new Set();
+  for (const a of adv.spec.areas.filter((x) => adv.revealed.includes(x.name)))
+    for (let x = a.x; x < a.x + a.w; x++) for (let y = a.y; y < a.y + a.h; y++) ok.add(x + "," + y);
+  for (const f of adv.spec.features || [])
+    if (BLOCK_KINDS.has(f.kind)) for (let x = f.x; x < f.x + f.w; x++) for (let y = f.y; y < f.y + f.h; y++) ok.delete(x + "," + y);
+  return ok;
+}
+
+// Adjusts each move so it ends on a free, walkable cell (the nearest one to where the AI wanted). Returns a note per changed move.
+async function safeMoves(moves) {
+  const tokens = await readTokens();
+  const walk = walkableCells();
+  const moving = new Set(moves.map((m) => m.id));
+  const taken = new Set(tokens.filter((t) => !moving.has(t.id)).map((t) => t.col + "," + t.row));
+  const notes = [];
+  const out = moves.map((m) => {
+    const cell = freeCell(taken, m.col, m.row, walk);
+    taken.add(cell.join(","));
+    if (cell[0] !== m.col || cell[1] !== m.row) notes.push(`${tokenNames[m.id] || "Token"} went to (${cell[0]}, ${cell[1]}) instead (target was taken or blocked)`);
+    return { ...m, col: cell[0], row: cell[1] };
+  });
+  return { moves: out, notes };
+}
+
 async function applyMoves(moves) {
   await ready;
   const dpi = await getDpi();
+  const fixed = await safeMoves(moves);
+  moves = fixed.moves;
+  if (fixed.notes.length) gmStatus(fixed.notes.join(". ") + ".");
   const byId = {};
   moves.forEach((m) => { byId[m.id] = m; });
   await OBR.scene.items.updateItems(moves.map((m) => m.id), (items) => {
@@ -1631,10 +1689,14 @@ $("clearBtn").addEventListener("click", async () => {
 
 /* ---------- AI actions (GM approves, camera auto-runs) ---------- */
 const handled = new Set();
-let pendingActions = [], shownKey = "";
+let pendingActions = [], shownKey = "", lastTokens = [];
 
 function describe(a) {
-  if (a.type === "spawn") return `Spawn ${a.count} x ${a.name} (${a.side}) near (${a.col}, ${a.row})`;
+  if (a.type === "spawn") {
+    const base = String(a.name).replace(/\s+\d+$/, "").trim();
+    const have = lastTokens.filter((t) => baseOf(t.name) === base.toLowerCase()).length;
+    return `Spawn ${a.count} more x ${base} (${a.side}) near (${a.col}, ${a.row})` + (have ? ` (${have} already on the map)` : "");
+  }
   if (a.type === "move") return `Move ${a.name} to (${a.col}, ${a.row})${a.reason ? ": " + a.reason : ""}`;
   if (a.type === "delete") return `Remove ${a.name}`;
   if (a.type === "fog") return a.on ? "Cover the scene in fog" : "Clear the fog";
@@ -1645,15 +1707,29 @@ function describe(a) {
 
 function resolveActions(ids) { api("/api/gm/actions/resolve", { room: roomId, ids }, true).catch(() => {}); }
 
-function freeCell(taken, c, r) {
-  for (let ring = 0; ring <= 6; ring++)
+// Nearest cell to (c, r) that is not taken and (if a walkable set is given) is walkable.
+function freeCell(taken, c, r, walk) {
+  for (let ring = 0; ring <= 12; ring++)
     for (let dx = -ring; dx <= ring; dx++)
       for (let dy = -ring; dy <= ring; dy++) {
         if (Math.max(Math.abs(dx), Math.abs(dy)) !== ring) continue;
-        const x = c + dx, y = r + dy;
-        if (x >= 0 && y >= 0 && !taken.has(x + "," + y)) return [x, y];
+        const x = c + dx, y = r + dy, k = x + "," + y;
+        if (x >= 0 && y >= 0 && !taken.has(k) && (!walk || walk.has(k))) return [x, y];
       }
   return [c, r];
+}
+
+// Finds exactly one non-player token by name. Exact name first; a plain name like "Goblin Warrior" only works if just one matches.
+const baseOf = (n) => String(n).replace(/\s+\d+$/, "").trim().toLowerCase();
+function matchToken(tokens, name, includePcs) {
+  const low = (s) => String(s).toLowerCase().trim();
+  const pool = includePcs ? tokens : tokens.filter((t) => t.side !== "pc");
+  const exact = pool.filter((t) => low(t.name) === low(name));
+  if (exact.length === 1) return exact[0];
+  const same = exact.length ? exact : pool.filter((t) => baseOf(t.name) === baseOf(name));
+  if (same.length === 1) return same[0];
+  if (!same.length) throw new Error(`No creature named "${name}" on the map.`);
+  throw new Error(`"${name}" could mean ${same.map((t) => t.name).join(", ")}. Move or remove it by hand, or ask the DM to name one.`);
 }
 
 async function focusCell(col, row, span) {
@@ -1689,30 +1765,28 @@ async function runAction(a) {
   await ready;
   const tokens = await readTokens();
   const lower = (s) => String(s).toLowerCase();
-  const find = (name) => {
-    const own = tokens.filter((t) => t.side !== "pc");
-    return own.find((t) => lower(t.name) === lower(name)) || own.find((t) => lower(t.name).startsWith(lower(name)));
-  };
   if (a.type === "spawn") {
+    const base = String(a.name).replace(/\s+\d+$/, "").trim();
     const taken = new Set(tokens.map((t) => t.col + "," + t.row));
-    const existing = tokens.filter((t) => lower(t.name).startsWith(lower(a.name))).length;
+    const walk = walkableCells();
+    // Number new creatures after the highest existing number for that name ("Goblin Warrior 3" follows 1 and 2).
+    const same = tokens.filter((t) => baseOf(t.name) === base.toLowerCase());
+    let top = 0;
+    same.forEach((t) => { const m = String(t.name).match(/\s(\d+)$/); top = Math.max(top, m ? +m[1] : 1); });
     const list = [];
     for (let i = 0; i < a.count; i++) {
-      const cell = freeCell(taken, a.col, a.row);
+      const cell = freeCell(taken, a.col, a.row, walk);
       taken.add(cell.join(","));
-      const n = a.count > 1 || existing ? existing + i + 1 : 0;
-      list.push({ name: n ? `${a.name} ${n}` : a.name, side: a.side, col: cell[0], row: cell[1] });
+      const n = a.count > 1 || same.length ? top + i + 1 : 0;
+      list.push({ name: n ? `${base} ${n}` : base, side: a.side, col: cell[0], row: cell[1] });
     }
     await spawnTokens(list, false);
   } else if (a.type === "move") {
-    const t = find(a.name);
-    if (!t) throw new Error(`No creature named "${a.name}" to move.`);
+    const t = matchToken(tokens, a.name);
+    tokenNames[t.id] = t.name;
     await applyMoves([{ id: t.id, col: a.col, row: a.row }]);
   } else if (a.type === "delete") {
-    const n = lower(a.name);
-    const targets = tokens.filter((t) => t.side !== "pc" && (lower(t.name) === n || lower(t.name).startsWith(n + " ")));
-    if (!targets.length) throw new Error(`No creature named "${a.name}" to remove.`);
-    const ids = targets.map((t) => t.id);
+    const ids = [matchToken(tokens, a.name).id];
     const labels = await OBR.scene.items.getItems((i) => i.metadata && ids.includes(i.metadata[FOR]));
     await OBR.scene.items.deleteItems([...ids, ...labels.map((l) => l.id)]);
   } else if (a.type === "reveal") {
@@ -1722,8 +1796,7 @@ async function runAction(a) {
   } else if (a.type === "camera") {
     let col = a.col, row = a.row;
     if (a.name) {
-      const t = find(a.name) || tokens.find((x) => lower(x.name) === lower(a.name));
-      if (!t) throw new Error(`No token named "${a.name}" to focus on.`);
+      const t = matchToken(tokens, a.name, true);
       col = t.col; row = t.row;
     }
     await broadcast(CAM, { col, row, span: 12 }, () => focusCell(col, row, 12));
@@ -1795,7 +1868,11 @@ async function handleActions(list) {
   }
   pendingActions = list.filter((a) => a.type !== "camera" && !handled.has(a.id));
   const key = pendingActions.map((a) => a.id).join(",");
-  if (key !== shownKey) { shownKey = key; renderActions(); }
+  if (key !== shownKey) {
+    shownKey = key;
+    try { lastTokens = await readTokens(); } catch (e) {}
+    renderActions();
+  }
 }
 
 /* ---------- start ---------- */
@@ -1884,7 +1961,7 @@ Remaining after that: Item 4 polish (move Access code box into GM tools, SSE ins
 - User tested v0.5.2 with the fixed manifest: PASSED. Art shows only inside revealed rooms, and reveal works for players ("test passed with the fog reveal"). The fog question (why `setFilled` did not hide MAP items for players) is moot for now; the rock mask handles hiding.
 - Next: user picks the next feature. Options offered: (a) Item 4 polish: move the Access code box into the GM screen, Server-Sent Events instead of 3-second polling, refreshed setup guide covering everything built; (b) later-ideas list: SRD monster/rules lookup, dice + combat tracker, session-zero campaign builder, persistent storage in a free database.
 
-## 18. v0.6.0 (latest): shared access code, live updates, official stat blocks (untested live)
+## 18. v0.6.0: shared access code, live updates, official stat blocks (untested live)
 User chose (via questions): GM shares the access code automatically; stat blocks are fed to the DM; stat blocks visible to the GM only; if a monster is not in the 2024 data, use the 2014 version.
 **Shared access code:** the "Access code" box moved from the story screen into the GM screen ("Player access code", under the GM code). The GM's panel writes it to room metadata key `com.aidm/access` (on startup and when changed); player panels read it at startup and via `OBR.room.onMetadataChange`, so players never type it. Players without it see "Waiting for the GM: the GM needs to open this panel...". Security note: anyone in the Owlbear room can read room metadata, so the code protects the server from strangers, not from people in the room. UNVERIFIED live: players can read room metadata (expected), `onMetadataChange` name.
 **Live updates:** server `GET /api/stream?room=` (needs X-Access-Code header) keeps a Server-Sent Events connection per panel (max 60 per room, heartbeat comment every 20 s) and sends `data: u` whenever the room changes (`notify(r)` in addMsg, DM busy on/off, clear, action resolve). The client reads it with fetch + ReadableStream (not EventSource, so the code stays in a header) and then calls /api/log. Fallback: polling every 3 s if no stream, every 15 s with a stream; reconnect after 5 s, or if no data for 45 s. fetchLog no longer drops an update that arrives mid-request. Tested locally: 4 events for say + Ask DM. UNVERIFIED: Render passes streams through without buffering (the 45 s watchdog falls back to polling if not).
@@ -1893,4 +1970,16 @@ User chose (via questions): GM shares the access code automatically; stat blocks
 - GM tools section 5 "Monster stat blocks (only you see these)" with "Show stat blocks" (`POST /api/gm/stats`, GM code) showing what the DM gets, plus the CC-BY 4.0 SRD attribution line.
 - Tested locally with a mocked Open5e and mocked Gemini: lookups, fallbacks, prompt injection, GM-only access all pass. The sandbox cannot reach Open5e, so the real API was only checked by reading its responses.
 **Next:** user uploads v0.6.0 and tests: (1) players no longer see an access code box and still play; (2) messages and DM replies appear instantly for everyone; (3) GM tools -> Show stat blocks lists real stats; (4) DM narration uses correct monster numbers. Then remaining options: refreshed setup guide, dice + combat tracker, session-zero campaign builder, persistent storage in a free database.
+
+## 19. v0.6.1 (latest): bug fixes from the v0.6.0 test (untested live)
+User test of v0.6.0: (1) first "Build map + monsters" failed with "The AI's answer wasn't in the expected format", second click worked; (2) a stray token "Goblin Warrior 1 2" appeared in room 2; (3) an AI move action moved that token when another was meant, onto a square a player already occupied. (Shared access code, live updates and stat blocks were not reported as broken.)
+**Root causes found:**
+- Positions were read with Math.round(position / dpi). Our square tokens are placed at the cell's top-left (+5% inset) but Owlbear player image tokens are placed at the cell CENTRE, so rounding put every player one cell right and down. The AI (and enemy moves) were given wrong player positions. Fix: Math.floor (correct for both).
+- The AI DM proposed spawning "Goblin Warrior 1" although it already existed (revealed rooms auto-spawn their creatures); the client appended " 2" to the given name. Name matching for move/delete took the first token whose name STARTED WITH the given name (could pick the wrong one; delete could remove several).
+- Long map JSON got cut off (output token limit; model thinking may also use the budget).
+**Fixes:**
+- Server: `gemini()` now detects finishReason MAX_TOKENS and ignores `thought` parts. New `geminiJson()` retries ONCE (costs one extra request) when the answer is cut off or malformed, with a note asking for complete short JSON. Build uses 16384 max tokens; maps limited to 6-14 areas, 10-30 features, short names. Ask DM: 6144 tokens; if the JSON is broken or cut off, the narration text is rescued with a regex so players never see raw JSON. Spawn action names lose trailing numbers. ACTIONS_PROMPT: use exact token names from the snapshot; never spawn creatures already on the map or belonging to hidden areas (use reveal); never move onto an occupied cell.
+- Client: `matchToken()` = exact name, else a base name only if exactly one token matches, else an error listing the candidates (move, delete, camera). Spawn numbering continues after the highest existing number ("Goblin Warrior 3"); the approval card says "Spawn N more x Name (K already on the map)". `safeMoves()` runs before every move (AI action, Apply, Apply all): each move ends on the nearest cell that is free (no other token, including other moves in the same batch) and walkable (inside a revealed area, not a blocking feature), and the GM status explains any adjustment. `freeCell()` takes an optional walkable set (radius 12). Spawns also use walkable cells.
+- Tested locally: map retry after a cut-off answer, narration rescue, and unit tests of matchToken/freeCell/spawn numbering/floor all pass.
+**Next:** user uploads v0.6.1 and re-tests build, AI spawn/move/remove actions, and Suggest moves near player tokens. Then remaining options: refreshed setup guide, dice + combat tracker, session-zero campaign builder, persistent storage in a free database.
 

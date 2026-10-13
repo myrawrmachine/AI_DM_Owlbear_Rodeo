@@ -330,8 +330,8 @@ async function readTokens() {
     id: i.id,
     name: i.name || "Unnamed",
     side: (i.metadata && i.metadata[SIDE]) || "pc",
-    col: Math.round(i.position.x / dpi),
-    row: Math.round(i.position.y / dpi),
+    col: Math.floor(i.position.x / dpi),
+    row: Math.floor(i.position.y / dpi),
   }));
 }
 
@@ -771,9 +771,41 @@ function renderMoves() {
   });
 }
 
+const BLOCK_KINDS = new Set(["pillar", "statue", "table", "water", "tree", "altar", "chest"]);
+// Cells a creature may stand on: inside a revealed area and not on a blocking feature. null = no built map (anything goes).
+function walkableCells() {
+  const adv = advGet();
+  if (!adv || !adv.spec) return null;
+  const ok = new Set();
+  for (const a of adv.spec.areas.filter((x) => adv.revealed.includes(x.name)))
+    for (let x = a.x; x < a.x + a.w; x++) for (let y = a.y; y < a.y + a.h; y++) ok.add(x + "," + y);
+  for (const f of adv.spec.features || [])
+    if (BLOCK_KINDS.has(f.kind)) for (let x = f.x; x < f.x + f.w; x++) for (let y = f.y; y < f.y + f.h; y++) ok.delete(x + "," + y);
+  return ok;
+}
+
+// Adjusts each move so it ends on a free, walkable cell (the nearest one to where the AI wanted). Returns a note per changed move.
+async function safeMoves(moves) {
+  const tokens = await readTokens();
+  const walk = walkableCells();
+  const moving = new Set(moves.map((m) => m.id));
+  const taken = new Set(tokens.filter((t) => !moving.has(t.id)).map((t) => t.col + "," + t.row));
+  const notes = [];
+  const out = moves.map((m) => {
+    const cell = freeCell(taken, m.col, m.row, walk);
+    taken.add(cell.join(","));
+    if (cell[0] !== m.col || cell[1] !== m.row) notes.push(`${tokenNames[m.id] || "Token"} went to (${cell[0]}, ${cell[1]}) instead (target was taken or blocked)`);
+    return { ...m, col: cell[0], row: cell[1] };
+  });
+  return { moves: out, notes };
+}
+
 async function applyMoves(moves) {
   await ready;
   const dpi = await getDpi();
+  const fixed = await safeMoves(moves);
+  moves = fixed.moves;
+  if (fixed.notes.length) gmStatus(fixed.notes.join(". ") + ".");
   const byId = {};
   moves.forEach((m) => { byId[m.id] = m; });
   await OBR.scene.items.updateItems(moves.map((m) => m.id), (items) => {
@@ -822,10 +854,14 @@ $("clearBtn").addEventListener("click", async () => {
 
 /* ---------- AI actions (GM approves, camera auto-runs) ---------- */
 const handled = new Set();
-let pendingActions = [], shownKey = "";
+let pendingActions = [], shownKey = "", lastTokens = [];
 
 function describe(a) {
-  if (a.type === "spawn") return `Spawn ${a.count} x ${a.name} (${a.side}) near (${a.col}, ${a.row})`;
+  if (a.type === "spawn") {
+    const base = String(a.name).replace(/\s+\d+$/, "").trim();
+    const have = lastTokens.filter((t) => baseOf(t.name) === base.toLowerCase()).length;
+    return `Spawn ${a.count} more x ${base} (${a.side}) near (${a.col}, ${a.row})` + (have ? ` (${have} already on the map)` : "");
+  }
   if (a.type === "move") return `Move ${a.name} to (${a.col}, ${a.row})${a.reason ? ": " + a.reason : ""}`;
   if (a.type === "delete") return `Remove ${a.name}`;
   if (a.type === "fog") return a.on ? "Cover the scene in fog" : "Clear the fog";
@@ -836,15 +872,29 @@ function describe(a) {
 
 function resolveActions(ids) { api("/api/gm/actions/resolve", { room: roomId, ids }, true).catch(() => {}); }
 
-function freeCell(taken, c, r) {
-  for (let ring = 0; ring <= 6; ring++)
+// Nearest cell to (c, r) that is not taken and (if a walkable set is given) is walkable.
+function freeCell(taken, c, r, walk) {
+  for (let ring = 0; ring <= 12; ring++)
     for (let dx = -ring; dx <= ring; dx++)
       for (let dy = -ring; dy <= ring; dy++) {
         if (Math.max(Math.abs(dx), Math.abs(dy)) !== ring) continue;
-        const x = c + dx, y = r + dy;
-        if (x >= 0 && y >= 0 && !taken.has(x + "," + y)) return [x, y];
+        const x = c + dx, y = r + dy, k = x + "," + y;
+        if (x >= 0 && y >= 0 && !taken.has(k) && (!walk || walk.has(k))) return [x, y];
       }
   return [c, r];
+}
+
+// Finds exactly one non-player token by name. Exact name first; a plain name like "Goblin Warrior" only works if just one matches.
+const baseOf = (n) => String(n).replace(/\s+\d+$/, "").trim().toLowerCase();
+function matchToken(tokens, name, includePcs) {
+  const low = (s) => String(s).toLowerCase().trim();
+  const pool = includePcs ? tokens : tokens.filter((t) => t.side !== "pc");
+  const exact = pool.filter((t) => low(t.name) === low(name));
+  if (exact.length === 1) return exact[0];
+  const same = exact.length ? exact : pool.filter((t) => baseOf(t.name) === baseOf(name));
+  if (same.length === 1) return same[0];
+  if (!same.length) throw new Error(`No creature named "${name}" on the map.`);
+  throw new Error(`"${name}" could mean ${same.map((t) => t.name).join(", ")}. Move or remove it by hand, or ask the DM to name one.`);
 }
 
 async function focusCell(col, row, span) {
@@ -880,30 +930,28 @@ async function runAction(a) {
   await ready;
   const tokens = await readTokens();
   const lower = (s) => String(s).toLowerCase();
-  const find = (name) => {
-    const own = tokens.filter((t) => t.side !== "pc");
-    return own.find((t) => lower(t.name) === lower(name)) || own.find((t) => lower(t.name).startsWith(lower(name)));
-  };
   if (a.type === "spawn") {
+    const base = String(a.name).replace(/\s+\d+$/, "").trim();
     const taken = new Set(tokens.map((t) => t.col + "," + t.row));
-    const existing = tokens.filter((t) => lower(t.name).startsWith(lower(a.name))).length;
+    const walk = walkableCells();
+    // Number new creatures after the highest existing number for that name ("Goblin Warrior 3" follows 1 and 2).
+    const same = tokens.filter((t) => baseOf(t.name) === base.toLowerCase());
+    let top = 0;
+    same.forEach((t) => { const m = String(t.name).match(/\s(\d+)$/); top = Math.max(top, m ? +m[1] : 1); });
     const list = [];
     for (let i = 0; i < a.count; i++) {
-      const cell = freeCell(taken, a.col, a.row);
+      const cell = freeCell(taken, a.col, a.row, walk);
       taken.add(cell.join(","));
-      const n = a.count > 1 || existing ? existing + i + 1 : 0;
-      list.push({ name: n ? `${a.name} ${n}` : a.name, side: a.side, col: cell[0], row: cell[1] });
+      const n = a.count > 1 || same.length ? top + i + 1 : 0;
+      list.push({ name: n ? `${base} ${n}` : base, side: a.side, col: cell[0], row: cell[1] });
     }
     await spawnTokens(list, false);
   } else if (a.type === "move") {
-    const t = find(a.name);
-    if (!t) throw new Error(`No creature named "${a.name}" to move.`);
+    const t = matchToken(tokens, a.name);
+    tokenNames[t.id] = t.name;
     await applyMoves([{ id: t.id, col: a.col, row: a.row }]);
   } else if (a.type === "delete") {
-    const n = lower(a.name);
-    const targets = tokens.filter((t) => t.side !== "pc" && (lower(t.name) === n || lower(t.name).startsWith(n + " ")));
-    if (!targets.length) throw new Error(`No creature named "${a.name}" to remove.`);
-    const ids = targets.map((t) => t.id);
+    const ids = [matchToken(tokens, a.name).id];
     const labels = await OBR.scene.items.getItems((i) => i.metadata && ids.includes(i.metadata[FOR]));
     await OBR.scene.items.deleteItems([...ids, ...labels.map((l) => l.id)]);
   } else if (a.type === "reveal") {
@@ -913,8 +961,7 @@ async function runAction(a) {
   } else if (a.type === "camera") {
     let col = a.col, row = a.row;
     if (a.name) {
-      const t = find(a.name) || tokens.find((x) => lower(x.name) === lower(a.name));
-      if (!t) throw new Error(`No token named "${a.name}" to focus on.`);
+      const t = matchToken(tokens, a.name, true);
       col = t.col; row = t.row;
     }
     await broadcast(CAM, { col, row, span: 12 }, () => focusCell(col, row, 12));
@@ -986,7 +1033,11 @@ async function handleActions(list) {
   }
   pendingActions = list.filter((a) => a.type !== "camera" && !handled.has(a.id));
   const key = pendingActions.map((a) => a.id).join(",");
-  if (key !== shownKey) { shownKey = key; renderActions(); }
+  if (key !== shownKey) {
+    shownKey = key;
+    try { lastTokens = await readTokens(); } catch (e) {}
+    renderActions();
+  }
 }
 
 /* ---------- start ---------- */

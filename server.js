@@ -71,6 +71,9 @@ OUTPUT FORMAT: reply with ONLY valid JSON: {"narration": string, "actions": [ ..
 - "narration" is what you say to the players (markdown allowed). Never reveal secret notes in it.
 - "actions" is optional (use [] when nothing is needed). The GM approves actions before anything happens, so only propose them when the story clearly calls for it. At most 6.
 - Use grid cells from the map snapshot (col and row start at 0 in the top-left).
+- For move, delete, camera and light, use a token's EXACT name from the map snapshot (for example "Goblin Warrior 2").
+- Do NOT spawn creatures that are already on the map snapshot, and do NOT spawn the creatures of a hidden area: they appear automatically when that area is revealed, so use "reveal" instead. Only spawn genuinely new arrivals (reinforcements, summons, a newly introduced NPC).
+- Never move a creature onto a cell that another token occupies.
 - Action types:
   {"type":"spawn","name":"Goblin","count":3,"side":"enemy"|"npc"|"ally","col":int,"row":int}   (creatures that enter the scene now)
   {"type":"move","name":"Goblin 1","col":int,"row":int,"reason":"short"}   (only enemy/npc/ally tokens, never player characters)
@@ -87,7 +90,7 @@ function sanitizeActions(list) {
     const type = str(a.type, 12);
     const name = str(a.name, 40);
     if (type === "spawn" && name)
-      out.push({ type, name, count: clampInt(a.count, 1, 12, 1), side: ["enemy", "npc", "ally"].includes(a.side) ? a.side : "enemy", col: clampInt(a.col, 0, 200, 0), row: clampInt(a.row, 0, 200, 0) });
+      out.push({ type, name: baseName(name) || name, count: clampInt(a.count, 1, 12, 1), side: ["enemy", "npc", "ally"].includes(a.side) ? a.side : "enemy", col: clampInt(a.col, 0, 200, 0), row: clampInt(a.row, 0, 200, 0) });
     else if (type === "move" && name)
       out.push({ type, name, col: clampInt(a.col, 0, 200, 0), row: clampInt(a.row, 0, 200, 0), reason: str(a.reason, 80) });
     else if (type === "delete" && name) out.push({ type, name });
@@ -183,10 +186,26 @@ async function gemini({ system, contents, json: wantJson, model, maxTokens }) {
       throw new Error("The free AI quota is used up for the moment. Wait a minute (or until tomorrow if it's the daily cap) and try again.");
     throw new Error("AI error: " + ((data.error && data.error.message) || resp.status));
   }
-  const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
-  const text = (parts || []).map((p) => p.text || "").join("").trim();
-  if (!text) throw new Error("The AI returned an empty answer (it may have been blocked). Try rephrasing.");
+  const cand = data.candidates && data.candidates[0];
+  const parts = cand && cand.content && cand.content.parts;
+  const text = (parts || []).filter((p) => !p.thought).map((p) => p.text || "").join("").trim();
+  const cut = cand && cand.finishReason === "MAX_TOKENS";
+  if (!text) throw new Error(cut ? "The AI ran out of room before answering. Please try again." : "The AI returned an empty answer (it may have been blocked). Try rephrasing.");
+  if (cut && wantJson) { const e = new Error("cut off"); e.cutOff = true; e.text = text; throw e; }
   return text;
+}
+// Asks for JSON and, if the answer comes back cut off or malformed, asks once more (costs one extra request).
+async function geminiJson(opts) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const sys = attempt ? opts.system + "\n\nIMPORTANT: your previous answer was cut off or was not valid JSON. Reply again with complete, valid JSON only, and keep descriptions short." : opts.system;
+    try {
+      return parseJson(await gemini({ ...opts, system: sys, json: true }));
+    } catch (e) {
+      if (attempt === 0 && (e.cutOff || /expected format/.test(e.message))) { console.log("Retrying malformed AI JSON"); continue; }
+      if (e.cutOff) throw new Error("The AI's answer was too long and got cut off. Try again, or make the map smaller (fewer Cols/Rows).");
+      throw e;
+    }
+  }
 }
 function parseJson(t) {
   t = t.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
@@ -364,8 +383,8 @@ Rules:
 - All numbers are whole grid cells (1 cell = 5 feet). x and y are the top-left cell, starting at 0. Everything must fit inside cols x rows.
 - "areas" are the walkable floor. Anything not covered by an area is solid rock or wall.
 - Lay out EVERY scene or location in the adventure notes, in story order, from one end of the map to the other. Name each main area after its scene or location (for example "Scene 1: Flooded Entry"). Link areas with corridors (kind "corridor", 2 cells wide) so everything is reachable.
-- Use 6 to 16 areas. Rooms should be at least 5x5 cells, and big encounter rooms 8x8 or larger. Leave empty space between rooms.
-- Put "features" inside areas: cover, hazards, doors at area edges, and interesting objects that fit the story. Use 10 to 40 features. Keep each 1 to 3 cells.
+- Use 6 to 14 areas. Rooms should be at least 5x5 cells, and big encounter rooms 8x8 or larger. Leave empty space between rooms.
+- Put "features" inside areas: cover, hazards, doors at area edges, and interesting objects that fit the story. Use 10 to 30 features. Keep every name short (under 5 words). Keep each 1 to 3 cells.
 - "creatures": include EVERY monster and NPC from the notes, in the area where the party meets them. Use the exact area name. Use the counts in the notes (maximum 12 per entry). Give the creature name without numbers. Use the official D&D 2024 (SRD 5.2) monster name when one fits (for example "Goblin Warrior", "Bandit", "Skeleton", "Cultist"), so the creature's official stats can be looked up. Leave out the player characters.`;
 
 const MOVES_SYSTEM = `You control the enemies and NPCs in a tabletop D&D (2024, 5.5e) combat. Output ONLY valid JSON, no commentary.
@@ -475,12 +494,18 @@ async function handleApi(req, res, url, query) {
       notify(r);
       try {
         const stats = await statsBlock(creatureNames(r, body.creatures));
-        const raw = await gemini({
+        let raw;
+        try {
+          raw = await gemini({
           system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + advBlock(r) + stats + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
           contents: buildContents(r.msgs),
           json: true,
-          maxTokens: 4096,
+          maxTokens: 6144,
         });
+        } catch (e) {
+          if (!e.cutOff) throw e;
+          raw = e.text; // cut off near the end: keep whatever story text arrived
+        }
         let narration = raw, actions = [];
         try {
           const p = parseJson(raw);
@@ -488,7 +513,11 @@ async function handleApi(req, res, url, query) {
             narration = p.narration.trim();
             actions = sanitizeActions(p.actions);
           }
-        } catch (e) {}
+        } catch (e) {
+          // Broken JSON: pull out just the story text so players never see raw code.
+          const m = raw.match(/"narration"\s*:\s*"((?:[^"\\]|\\.)*)/);
+          if (m) { try { narration = JSON.parse('"' + m[1] + '"'); } catch (x) { narration = m[1].replace(/\\n/g, "\n").replace(/\\"/g, '"'); } }
+        }
         addMsg(r, "dm", "DM", narration);
         actions.forEach((a) => r.pending.push({ id: r.aseq++, ...a }));
         r.pending = r.pending.slice(-30);
@@ -582,17 +611,15 @@ async function handleApi(req, res, url, query) {
       const cols = clampInt(body.cols, 20, 60, 60);
       const rows = clampInt(body.rows, 15, 45, 40);
       const notes = str(body.notes, 500);
-      const t = await gemini({
+      const parsed = await geminiJson({
         model: PLAN_MODEL,
-        json: true,
-        maxTokens: 8192,
+        maxTokens: 16384,
         system: MAP_SYSTEM,
         contents: one(
           `Map size: cols=${cols}, rows=${rows}.\n` + (notes ? `Extra instructions from the GM: ${notes}\n` : "") +
           `\nADVENTURE NOTES:\n${r.brief.slice(0, 9000)}`
         ),
       });
-      const parsed = parseJson(t);
       const spec = sanitizeMap({ ...parsed, cols, rows });
       if (!spec.areas.length) throw new Error("The AI didn't produce any rooms. Please try again.");
       const tokens = placeCreatures(spec, parsed.creatures);
@@ -611,9 +638,9 @@ async function handleApi(req, res, url, query) {
       const rows = clampInt(body.rows, 8, 200, 30);
       const situation = str(body.situation, 500);
       const stats = await statsBlock(creatureNames(r, movable.map((k) => k.name)), 5000);
-      const t = await gemini({
+      const parsed = await geminiJson({
         model: PLAN_MODEL,
-        json: true,
+        maxTokens: 4096,
         system: MOVES_SYSTEM,
         contents: one(
           (str(body.layout, 4000) ? `${str(body.layout, 4000)}\n\n` : "") +
@@ -622,7 +649,6 @@ async function handleApi(req, res, url, query) {
           `\n\nRecent story:\n${recentStory(r, 8)}` + briefBlock(r) + stats
         ),
       });
-      const parsed = parseJson(t);
       const ids = new Set(movable.map((k) => k.id));
       const moves = (Array.isArray(parsed.moves) ? parsed.moves : [])
         .filter((m) => ids.has(m.id))
