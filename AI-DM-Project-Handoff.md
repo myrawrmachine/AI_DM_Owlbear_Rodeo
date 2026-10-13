@@ -169,6 +169,30 @@ const SYSTEM_PROMPT = `You are the Dungeon Master for a group of several players
 - When new enemies or NPCs appear, say clearly who and how many so the GM can place their tokens.
 - End scenes with a prompt like "What do you do?"`;
 
+async function fetchArt(prompt, w, h) {
+  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${w}&height=${h}&nologo=true&seed=${Math.floor(Math.random() * 1e6)}`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 70000);
+    try {
+      const resp = await fetch(url, { signal: ctrl.signal });
+      if (resp.status === 429 && attempt === 0) { await new Promise((ok) => setTimeout(ok, 16000)); continue; }
+      if (!resp.ok) throw new Error("The image service answered " + resp.status + ".");
+      const type = resp.headers.get("content-type") || "";
+      if (!type.startsWith("image/")) throw new Error("The image service didn't return a picture.");
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.length < 1000 || buf.length > 6000000) throw new Error("The picture was empty or too large.");
+      return { buf, type };
+    } catch (e) {
+      if (e.name === "AbortError") throw new Error("The image service took too long. Try again in a minute.");
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw new Error("The image service is busy. Try again in a minute.");
+}
+
 const ACTIONS_PROMPT = `
 
 OUTPUT FORMAT: reply with ONLY valid JSON: {"narration": string, "actions": [ ... ]}
@@ -208,7 +232,7 @@ function sanitizeActions(list) {
 const rooms = {};
 function getRoom(id) {
   id = String(id || "default").slice(0, 100);
-  if (!rooms[id]) rooms[id] = { msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1, adv: null };
+  if (!rooms[id]) rooms[id] = { id, msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1, adv: null, art: null, artV: 0 };
   return rooms[id];
 }
 function addMsg(r, role, who, text) {
@@ -325,6 +349,7 @@ function sanitizeMap(s) {
   const list = (v, n) => (Array.isArray(v) ? v.slice(0, n) : []);
   return {
     title: str(s.title, 60) || "Map",
+    art: str(s.art, 200),
     cols,
     rows,
     areas: list(s.areas, 30).map((a) => ({ name: str(a.name, 40) || "Area", kind: str(a.kind, 20) || "room", ...fix(a) })),
@@ -336,8 +361,10 @@ const MAP_SYSTEM = `You design a single top-down battle map that contains an ENT
 Schema: {"title": string, "cols": integer, "rows": integer,
  "areas": [{"name": string, "kind": "room"|"corridor"|"outdoor"|"water", "x": int, "y": int, "w": int, "h": int}],
  "features": [{"name": string, "kind": "pillar"|"door"|"table"|"statue"|"water"|"hazard"|"stairs"|"tree"|"chest"|"altar", "x": int, "y": int, "w": int, "h": int}],
- "creatures": [{"name": string, "count": int, "side": "enemy"|"npc"|"ally", "area": string}]}
+ "creatures": [{"name": string, "count": int, "side": "enemy"|"npc"|"ally", "area": string}],
+ "art": string}
 Rules:
+- "art": 10 to 20 words describing the ground and mood of the whole adventure as a top-down background texture (for example "mossy flooded flagstones, dark swamp ruin, faint torchlight"). No characters and no text.
 - All numbers are whole grid cells (1 cell = 5 feet). x and y are the top-left cell, starting at 0. Everything must fit inside cols x rows.
 - "areas" are the walkable floor. Anything not covered by an area is solid rock or wall.
 - Lay out EVERY scene or location in the adventure notes, in story order, from one end of the map to the other. Name each main area after its scene or location (for example "Scene 1: Flooded Entry"). Link areas with corridors (kind "corridor", 2 cells wide) so everything is reachable.
@@ -506,6 +533,16 @@ async function handleApi(req, res, url, query) {
       return json(res, 200, { ok: true });
     }
 
+    if (url === "/api/gm/art") {
+      const cols = clampInt(body.cols, 10, 60, 40), rows = clampInt(body.rows, 8, 45, 30);
+      const w = 1280, h = Math.max(512, Math.min(1280, Math.round((1280 * rows) / cols)));
+      const art = str(body.art, 200) || "ancient stone dungeon floor, faint torchlight";
+      const prompt = `top-down view, ${art}, painted fantasy battle map ground texture, rich detail, no characters, no text, no grid lines, no border`;
+      r.art = await fetchArt(prompt, w, h);
+      r.artV += 1;
+      return json(res, 200, { url: `/art/${encodeURIComponent(r.id)}.jpg?v=${r.artV}` });
+    }
+
     if (url === "/api/gm/actions/resolve") {
       const ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(Number));
       r.pending = r.pending.filter((a) => !ids.has(a.id));
@@ -595,6 +632,14 @@ http.createServer((req, res) => {
   const url = u.pathname;
   if (req.method === "OPTIONS") { res.writeHead(204, headers("text/plain")); return res.end(); }
   if (url.startsWith("/api/")) return handleApi(req, res, url, u.searchParams);
+  if (req.method === "GET" && url.startsWith("/art/")) {
+    let id = "";
+    try { id = decodeURIComponent(url.slice(5).replace(/\.jpg$/, "")); } catch (e) {}
+    const r = rooms[id];
+    if (!r || !r.art) return json(res, 404, { error: "No art for this room yet." });
+    res.writeHead(200, { ...headers(r.art.type), "Cache-Control": "public, max-age=3600" });
+    return res.end(r.art.buf);
+  }
   if (req.method === "GET" && FILES[url]) {
     const [file, type] = FILES[url];
     return fs.readFile(path.join(__dirname, file), (err, data) => {
@@ -702,6 +747,7 @@ http.createServer((req, res) => {
   <div class="line"><input type="text" id="notes" placeholder="Optional extra instructions (e.g. make it a ruined swamp temple)"></div>
   <div class="line">Cols <input type="number" id="cols" value="60" min="20" max="60"> Rows <input type="number" id="rows" value="40" min="15" max="45"><button id="build">Build map + monsters</button></div>
   <div class="line"><label><input type="checkbox" id="hideRooms" checked> Hide unexplored rooms until revealed</label></div>
+  <div class="line"><label><input type="checkbox" id="artOn" checked> Paint a background picture (free image service)</label><button id="addArt" class="alt">Add art to current map</button></div>
   <div id="legend"></div>
   <div id="rooms"></div>
 
@@ -724,7 +770,7 @@ http.createServer((req, res) => {
 </div>
 
 <script type="module">
-import OBR, { buildShape, buildLabel, buildLight } from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm";
+import OBR, { buildShape, buildLabel, buildLight, buildImage } from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm";
 
 const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("input"), codeEl = $("code"), useMap = $("useMap");
@@ -984,19 +1030,53 @@ async function clearGenerated() {
   if (old.length) await OBR.scene.items.deleteItems(old.map((i) => i.id));
 }
 
-function mapRect(dpi, x, y, w, h, fill, stroke, name, z) {
+function mapRect(dpi, x, y, w, h, fill, stroke, name, z, op) {
   return buildShape().width(w * dpi).height(h * dpi).shapeType("RECTANGLE")
-    .position({ x: x * dpi, y: y * dpi }).fillColor(fill).fillOpacity(1)
+    .position({ x: x * dpi, y: y * dpi }).fillColor(fill).fillOpacity(op === undefined ? 1 : op)
     .strokeColor(stroke).strokeWidth(2).layer("MAP").name(name).zIndex(z).locked(true)
     .metadata({ [GEN]: true }).build();
 }
 
-async function drawBase(spec) {
+const imageSize = (url) => new Promise((ok, bad) => {
+  const i = new Image();
+  i.onload = () => ok({ width: i.naturalWidth, height: i.naturalHeight });
+  i.onerror = () => bad(new Error("The art picture could not be loaded."));
+  i.src = url;
+});
+
+// Background (and optional painted art with a dark shade over it). Returns true if the art was used.
+async function drawBase(spec, artUrl) {
   const dpi = await getDpi();
-  await OBR.scene.items.addItems([mapRect(dpi, 0, 0, spec.cols, spec.rows, "#15171f", "#15171f", spec.title, 0)]);
+  const items = [mapRect(dpi, 0, 0, spec.cols, spec.rows, "#15171f", "#15171f", spec.title, 0)];
+  let used = false;
+  if (artUrl) {
+    try {
+      const { width, height } = await imageSize(artUrl);
+      const scale = (dpi * spec.cols) / width;
+      const art = buildImage({ url: artUrl, width, height, mime: "image/jpeg" }, { dpi, offset: { x: 0, y: 0 } })
+        .layer("MAP").scale({ x: scale, y: scale }).zIndex(1).locked(true).name("Map art")
+        .metadata({ [GEN]: true }).build();
+      items.push(art, mapRect(dpi, 0, 0, spec.cols, spec.rows, "#000000", "#000000", "Shade", 2, 0.55));
+      used = true;
+    } catch (e) { console.error(e); }
+  }
+  await OBR.scene.items.addItems(items);
   try {
     await OBR.viewport.animateToBounds({ min: { x: 0, y: 0 }, max: { x: spec.cols * dpi, y: spec.rows * dpi }, width: spec.cols * dpi, height: spec.rows * dpi, center: { x: spec.cols * dpi / 2, y: spec.rows * dpi / 2 } });
   } catch (e) {}
+  return used;
+}
+
+function areaItems(dpi, spec, a, artOn) {
+  const items = [mapRect(dpi, a.x, a.y, a.w, a.h, FLOOR[a.kind] || FLOOR.room, "#6b7090", a.name, 3, artOn ? 0.5 : 1)];
+  for (const f of spec.features.filter((x) => featureOwner(spec, x) === a.name))
+    items.push(mapRect(dpi, f.x, f.y, f.w, f.h, THING[f.kind] || "#8a8a99", "#222", f.name, 4, 1));
+  return items;
+}
+
+async function getArt(spec) {
+  const d = await api("/api/gm/art", { room: roomId, art: spec.art, cols: spec.cols, rows: spec.rows }, true);
+  return location.origin + d.url;
 }
 
 /* ---- adventure state: map, creatures per room, which rooms are revealed (kept on this device) ---- */
@@ -1038,9 +1118,7 @@ async function revealArea(name, quiet) {
   const dpi = await getDpi();
   const items = [], spawns = [];
   for (const a of group) {
-    items.push(mapRect(dpi, a.x, a.y, a.w, a.h, FLOOR[a.kind] || FLOOR.room, "#6b7090", a.name, 2));
-    for (const f of spec.features.filter((x) => featureOwner(spec, x) === a.name))
-      items.push(mapRect(dpi, f.x, f.y, f.w, f.h, THING[f.kind] || "#8a8a99", "#222", f.name, 3));
+    items.push(...areaItems(dpi, spec, a, !!adv.art));
     spawns.push(...adv.tokens.filter((t) => t.area === a.name));
     adv.revealed.push(a.name);
   }
@@ -1118,18 +1196,24 @@ busyBtn($("build"), "Building...", async () => {
   if (!(await OBR.scene.isReady())) throw new Error("No scene is open. In Owlbear, create or open a scene first (the scenes menu), then try again.");
   const text = $("brief").value;
   if (!text.trim()) throw new Error("Write or draft a brief in section 1 first.");
-  gmStatus("Step 1 of 3: saving your brief...");
+  gmStatus("Step 1 of 4: saving your brief...");
   store("brief-" + roomId, text);
   await api("/api/gm/brief", { room: roomId, brief: text }, true);
-  gmStatus("Step 2 of 3: the AI is designing the map and monsters. This can take up to a minute...");
+  gmStatus("Step 2 of 4: the AI is designing the map and monsters. This can take up to a minute...");
   const d = await api("/api/gm/build", {
     room: roomId, notes: $("notes").value, cols: +$("cols").value, rows: +$("rows").value,
   }, true);
-  gmStatus("Step 3 of 3: drawing the map...");
+  let artUrl = "", artNote = "";
+  if ($("artOn").checked) {
+    gmStatus("Step 3 of 4: painting the background art (this can take up to a minute)...");
+    try { artUrl = await getArt(d.spec); } catch (e) { artNote = " The art was skipped: " + e.message; }
+  }
+  gmStatus("Step 4 of 4: drawing the map...");
   try {
     await clearGenerated();
-    await drawBase(d.spec);
-    advSet({ spec: d.spec, tokens: d.tokens, revealed: [] });
+    const used = await drawBase(d.spec, artUrl);
+    if (artUrl && !used) artNote = " The art picture could not be loaded.";
+    advSet({ spec: d.spec, tokens: d.tokens, revealed: [], art: used ? artUrl : "" });
     store("map-" + roomId, JSON.stringify(d.spec));
     const start = d.spec.areas.find((a) => a.kind !== "corridor") || d.spec.areas[0];
     if ($("hideRooms").checked) await revealArea(start.name, true);
@@ -1142,8 +1226,26 @@ busyBtn($("build"), "Building...", async () => {
     (Object.keys(byArea).map((a) => `${a}: ${byArea[a].join(", ")}`).join("\n") || "none");
   renderRooms();
   gmStatus($("hideRooms").checked
-    ? `Done. Only the first room is visible. ${d.spec.areas.length} areas and ${d.tokens.length} creatures are ready; reveal rooms below or let the DM propose it.`
-    : `Done. Built ${d.spec.areas.length} areas and ${d.tokens.length} creatures. If you can't see the map, zoom out in Owlbear.`);
+    ? `Done. Only the first room is visible. ${d.spec.areas.length} areas and ${d.tokens.length} creatures are ready; reveal rooms below or let the DM propose it.${artNote}`
+    : `Done. Built ${d.spec.areas.length} areas and ${d.tokens.length} creatures. If you can't see the map, zoom out in Owlbear.${artNote}`);
+});
+
+busyBtn($("addArt"), "Painting...", async () => {
+  const adv = advGet();
+  if (!adv) throw new Error("Build the map first.");
+  if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room.");
+  await ready;
+  gmStatus("Painting the background art (this can take up to a minute)...");
+  const url = await getArt(adv.spec);
+  const old = await OBR.scene.items.getItems((i) => i.metadata && i.metadata[GEN] === true);
+  if (old.length) await OBR.scene.items.deleteItems(old.map((i) => i.id));
+  adv.art = (await drawBase(adv.spec, url)) ? url : "";
+  const dpi = await getDpi();
+  const items = [];
+  for (const a of adv.spec.areas.filter((x) => adv.revealed.includes(x.name))) items.push(...areaItems(dpi, adv.spec, a, !!adv.art));
+  if (items.length) await OBR.scene.items.addItems(items);
+  advSet(adv);
+  gmStatus(adv.art ? "Art added. Revealed rooms keep their creatures." : "The picture could not be loaded. The flat map was kept.");
 });
 
 busyBtn($("spawn"), "Spawning...", async () => {
@@ -1440,3 +1542,12 @@ async function handleActions(list) {
 - Item 2 DONE (untested live): **hidden rooms**. Build map + monsters draws only a dark background plus the first non-corridor room (and corridors touching it) when "Hide unexplored rooms" is ticked; other rooms and their creatures are NOT drawn/spawned until revealed. Reveal happens via the GM's Rooms list (Reveal / Reveal all) or an AI action `{"type":"reveal","area":"<room name>"}` that the GM approves. Revealing a room draws its floor (zIndex 2), the features it owns (zIndex 3), touching corridors, and spawns its creatures (tagged AUTO). The adventure state (spec, creatures per room, revealed list) is kept in the GM browser's localStorage key `adv-<roomId>` and mirrored to the server with `POST /api/gm/state` (GM code) so the DM prompt includes MAP LAYOUT, areas players can see, and hidden areas. State is re-sent on Unlock after a server restart. Limitation: reveal only works from the GM's browser/device that holds the saved state.
 - Design note: we hide rooms by not drawing them (no layer-order or fog-layer assumptions needed), so there is no "cover" shape and the GM also cannot see hidden rooms on the board (they appear in the Rooms list and legend).
 - Remaining: Item 3 map art on the map layer (image source: Pollinations legacy endpoint works for the user with a watermark; need server-side fetch + hosting + `buildImage` insertion), Item 4 polish (move Access code box into GM tools, SSE instead of polling, refresh setup guide).
+
+## 15. Progress: Item 3 map art built (v0.5), untested live
+- User tested v0.4 (hidden rooms + scene awareness): PASSED. User chose ONE big art image for the whole adventure (not per room).
+- Build map + monsters now has 4 steps. If "Paint a background picture" is ticked, the server fetches ONE image from Pollinations (`image.pollinations.ai/prompt/...&nologo=true`, 1280 wide, aspect from map size; 1 retry on 429; 70 s timeout; max 6 MB), stores it in memory per room and serves it at `/art/<roomId>.jpg?v=N` (public GET, no code needed so players' Owlbear can load it). The AI map JSON now includes an `art` field (10-20 word ground/mood description) used as the prompt.
+- Client draws on MAP layer: dark background (z0), art image via `buildImage` scaled to cover `cols` cells and locked (z1), 55% black shade (z2), then revealed room floors at 50% opacity (z3) and features (z4), so rooms stay readable on top of the art. Hidden rooms still hidden (art is only a mood backdrop, so it shows the whole backdrop, not room contents). Art failure never blocks the build (status says art was skipped).
+- New GM button "Add art to current map" repaints the art on an existing map and redraws revealed rooms.
+- Caveats: art lives in Render memory, so after a restart the image URL 404s (press Add art to current map to regenerate; the flat map keeps working). Art does not match the rectangle layout (backdrop only). Pollinations nologo may or may not remove the watermark; free anonymous tier is rate limited (about 1 request per 15 s).
+- UNVERIFIED live: `buildImage` call with a server URL (their code uses the same shape), whether Owlbear loads cross-origin images from our Render URL, art alignment at the scene origin.
+- Remaining: Item 4 polish (move Access code box into GM tools, SSE instead of polling, refresh setup guide to match everything built).
