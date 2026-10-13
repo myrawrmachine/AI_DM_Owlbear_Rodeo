@@ -9,6 +9,7 @@
   html, body { height: 100%; margin: 0; }
   body { background: #1e2231; color: #e8e8f0; font: 14px system-ui, sans-serif; display: flex; flex-direction: column; }
   .msg { margin: 0 0 10px; white-space: pre-wrap; line-height: 1.4; }
+  code { background: #2a3045; padding: 1px 4px; border-radius: 4px; }
   .you { color: #9db4ff; } .dm { color: #f1e3b0; } .sys { color: #ff9d9d; font-style: italic; }
   #story { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   #log { flex: 1; overflow-y: auto; padding: 10px; }
@@ -122,10 +123,21 @@ codeEl.value = store("dmcode") || "";
 $("gmcode").value = store("gmcode") || "";
 codeEl.addEventListener("change", () => store("dmcode", codeEl.value));
 
+// Minimal, safe markdown: HTML is escaped first, then bold, italic, code, headings and bullets are added.
+function md(t) {
+  const esc = String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return esc
+    .replace(/^#{1,6}\s*(.+)$/gm, "<strong>$1</strong>")
+    .replace(/^\s*[-*]\s+/gm, "\u2022 ")
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*(?!\s)([^*\n]+?)\*(?!\*)/g, "$1<em>$2</em>")
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>");
+}
+
 function add(cls, text) {
   const d = document.createElement("div");
   d.className = "msg " + cls;
-  d.textContent = text;
+  if (cls === "dm") d.innerHTML = md(text); else d.textContent = text;
   log.appendChild(d);
   log.scrollTop = log.scrollHeight;
 }
