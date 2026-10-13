@@ -31,6 +31,7 @@
   #gmstatus { margin: 6px 0 8px; padding: 6px 8px; background: #2a3045; border-radius: 6px; font-size: 13px; line-height: 1.35; min-height: 18px; }
   #gmstatus.bad { background: #5a2a2f; color: #ffd4d4; }
   #gm h4 { margin: 14px 0 6px; color: #f1e3b0; }
+  #gm details > .line:first-of-type { margin-top: 0; }
   #gm .hint { font-size: 12px; color: #aab; margin: 2px 0 6px; }
   #gm .line { display: flex; gap: 6px; margin: 4px 0; flex-wrap: wrap; align-items: center; }
   #brief { width: 100%; height: 150px; box-sizing: border-box; resize: vertical; }
@@ -46,6 +47,31 @@
   #rooms button { height: 26px; font-size: 12px; }
   #stats { white-space: pre-wrap; font: 12px/1.4 system-ui, sans-serif; color: #d9dbe8; background: #2a3045; border-radius: 6px; padding: 0 8px; margin: 6px 0; max-height: 320px; overflow-y: auto; }
   #stats:not(:empty) { padding: 8px; }
+  .roll { color: #b8f2c7; } .table { color: #aab0c8; font-style: italic; font-size: 13px; }
+  #combat { margin: 0 10px 6px; padding: 6px 8px; background: #262b3d; border: 1px solid #c0392b; border-radius: 8px; font-size: 13px; }
+  #combat .chead { display: flex; gap: 6px; align-items: center; margin-bottom: 4px; }
+  #combat .chead b { flex: 1; color: #ffb3a8; }
+  #combat button { height: 26px; font-size: 12px; padding: 0 8px; }
+  #clist { max-height: 150px; overflow-y: auto; }
+  .crow { display: flex; gap: 6px; align-items: center; padding: 2px 4px; border-radius: 4px; }
+  .crow.now { background: #4a3a1e; }
+  .crow.down { opacity: .5; text-decoration: line-through; }
+  .crow .cn { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .crow .ci { width: 26px; text-align: right; color: #f1e3b0; }
+  .crow input { width: 44px; padding: 2px 4px; }
+  .pc { color: #9db4ff; } .enemy { color: #ff9d9d; } .npc { color: #e6c86e; } .ally { color: #8fd0ff; }
+  #dice { flex: 1; min-width: 90px; }
+  .row.small button { height: 28px; font-size: 12px; padding: 0 8px; }
+  #charScreen { flex: 1; overflow-y: auto; padding: 10px; }
+  #charScreen label { display: block; font-size: 12px; color: #aab; margin: 8px 0 2px; }
+  #charScreen input, #charScreen textarea { width: 100%; box-sizing: border-box; }
+  #charScreen textarea { height: 110px; resize: vertical; }
+  #charScreen .two { display: flex; gap: 8px; } #charScreen .two > div { flex: 1; }
+  #gm details { border-top: 1px solid #3a4057; padding: 4px 0; }
+  #gm summary { cursor: pointer; padding: 8px 0 4px; color: #f1e3b0; font-weight: 600; }
+  #world, #bible { width: 100%; box-sizing: border-box; resize: vertical; }
+  #world { height: 80px; } #bible { height: 160px; }
+  #party, #intro { font-size: 12px; color: #c7c9d9; white-space: pre-wrap; margin: 4px 0; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -55,9 +81,24 @@
   <div id="log"><div class="msg dm">Welcome, adventurers. Each player: type what your character does and press Say. When everyone has spoken, one person presses Ask DM.</div></div>
   <div id="status"></div>
   <div id="actions" hidden></div>
+  <div id="combat" hidden>
+    <div class="chead"><b id="ctitle">Combat</b>
+      <button id="cInit" hidden>Roll initiative</button>
+      <button id="cBegin" hidden>Begin round 1</button>
+      <button id="cNext" hidden>Next turn</button></div>
+    <div id="clist"></div>
+  </div>
+  <div class="row small">
+    <input id="dice" type="text" placeholder="Roll: 1d20+5 attack">
+    <button id="rollBtn">Roll</button>
+    <button class="alt" data-roll="1d20">d20</button>
+    <button class="alt" data-roll="adv" title="Advantage: roll 2d20, keep the higher">Adv</button>
+    <button class="alt" data-roll="dis" title="Disadvantage: roll 2d20, keep the lower">Dis</button>
+  </div>
   <div class="row small">
     <label><input type="checkbox" id="useMap" checked> send map</label>
     <label><input type="checkbox" id="followCam" checked> follow DM camera</label>
+    <button id="charToggle" class="alt">My character</button>
     <button id="gmToggle" class="alt" hidden>GM tools</button>
   </div>
   <div class="row">
@@ -65,6 +106,23 @@
     <button id="sayBtn">Say</button>
     <button id="askBtn">Ask DM</button>
   </div>
+</div>
+
+<div id="charScreen" hidden>
+  <div class="line"><button id="charBack" class="alt">Back to story</button></div>
+  <h4 style="color:#f1e3b0;margin:10px 0 4px">My character</h4>
+  <div style="font-size:12px;color:#aab">Your GM and the AI DM use this card. Max HP and AC also go into the combat tracker.</div>
+  <label for="cName">Character name</label><input id="cName" type="text" maxlength="40">
+  <div class="two"><div><label for="cSpecies">Species</label><input id="cSpecies" type="text" maxlength="30" placeholder="e.g. Elf"></div>
+    <div><label for="cCls">Class</label><input id="cCls" type="text" maxlength="40" placeholder="e.g. Wizard"></div></div>
+  <div class="two"><div><label for="cLevel">Level</label><input id="cLevel" type="number" min="1" max="20" value="1"></div>
+    <div><label for="cMaxHp">Max HP</label><input id="cMaxHp" type="number" min="0" max="999"></div>
+    <div><label for="cAc">AC</label><input id="cAc" type="number" min="0" max="40"></div>
+    <div><label for="cInitB">Initiative bonus</label><input id="cInitB" type="number" min="-5" max="20" value="0"></div></div>
+  <label for="cStory">Backstory and goals (a few lines)</label>
+  <textarea id="cStory" maxlength="1200" placeholder="Where you come from, what you want, who you're looking for..."></textarea>
+  <div class="line" style="margin-top:8px"><button id="charSave">Save character</button></div>
+  <div id="charStatus" style="font-size:12px;color:#aab;margin-top:6px"></div>
 </div>
 
 <div id="gm" hidden>
@@ -76,7 +134,23 @@
  </div>
  <div id="gmbody">
 
-  <h4>1. Secret adventure brief</h4>
+  <details id="campSec">
+  <summary>Campaign (session zero)</summary>
+  <div class="hint">1. Each player opens <b>My character</b> on the story screen and fills in their card. 2. Describe your world here and press Build campaign. 3. Play sessions. 4. At the end of each session press End session: the AI writes a recap and drafts the next session's brief.</div>
+  <div class="line"><button id="partyBtn" class="alt">Refresh party</button></div>
+  <div id="party">No character cards yet.</div>
+  <div class="line">Sessions planned <input type="number" id="cSessions" value="6" min="1" max="30"></div>
+  <textarea id="world" placeholder="Your world idea: setting, tone, themes, and lines and veils (things to avoid or keep off-screen)."></textarea>
+  <div class="line"><button id="campBuild">Build campaign</button><button id="campSave" class="alt">Save notes</button></div>
+  <textarea id="bible" placeholder="Secret campaign notes appear here. Edit freely, then press Save notes."></textarea>
+  <div id="intro"></div>
+  <div class="line"><button id="introBtn" class="alt" hidden>Post intro to story</button><button id="recapBtn" class="alt" hidden>Post last recap to story</button></div>
+  <div class="line">Next: session <span id="sessNo">1</span> <input type="text" id="prepNote" placeholder="Wishes for the next session (optional)"></div>
+  <div class="line"><button id="endSess">End session: recap + prep next</button><button id="prepOnly" class="alt">Prep next session only</button></div>
+  </details>
+
+  <details id="briefSec" open>
+  <summary>Session brief (secret)</summary>
   <div class="hint">Only you see this. The AI uses it as secret notes and never shows it to players directly.</div>
   <div class="line">
     Level <input type="number" id="lvl" value="3" min="1" max="20">
@@ -86,7 +160,10 @@
   <div class="line"><button id="draft">Draft one-shot</button><button id="saveBrief" class="alt">Save brief</button></div>
   <textarea id="brief" placeholder="Paste or write your secret notes here, or draft a one-shot above. Edit freely, then press Save brief."></textarea>
 
-  <h4>2. Build the adventure map and monsters</h4>
+  </details>
+
+  <details open>
+  <summary>Build the map and monsters</summary>
   <div class="hint">Reads your saved brief, draws the whole adventure as one connected map, then places every monster and NPC from the brief in its room. Save the brief first. Pressing again replaces the previous generated map and creatures.</div>
   <div class="line"><input type="text" id="notes" placeholder="Optional extra instructions (e.g. make it a ruined swamp temple)"></div>
   <div class="line">Cols <input type="number" id="cols" value="60" min="20" max="60"> Rows <input type="number" id="rows" value="40" min="15" max="45"><button id="build">Build map + monsters</button></div>
@@ -95,27 +172,46 @@
   <div id="legend"></div>
   <div id="rooms"></div>
 
-  <h4>3. Add one more creature (optional)</h4>
+  </details>
+
+  <details id="combatSec">
+  <summary>Combat</summary>
+  <div class="hint">Start combat puts everyone into the turn order: player characters from their cards (or their tokens) and every monster, NPC and ally on the map, with official HP and AC. Players press Roll initiative on the story screen (anyone who hasn't is rolled for automatically when you press Begin). Next turn moves on; when it reaches the monsters, the AI runs all of them in one go (one AI request) and proposes moves and damage for you to approve.</div>
+  <div class="line"><button id="cStart">Start combat</button><button id="cBegin2" class="alt">Begin round 1</button><button id="cNext2" class="alt">Next turn</button><button id="cEnd" class="alt">End combat</button></div>
+  </details>
+
+  <details>
+  <summary>Add one more creature</summary>
   <div class="hint">For anything the brief missed. Tokens made here can also be moved by the AI's suggestions. Col and Row are grid cells.</div>
   <div class="line"><input type="text" id="tname" placeholder="Name (e.g. Goblin)"> Count <input type="number" id="tcount" value="1" min="1" max="12"></div>
   <div class="line">Col <input type="number" id="tcol" value="5" min="0"> Row <input type="number" id="trow" value="5" min="0">
     <select id="tside"><option value="enemy">Enemy</option><option value="npc">NPC</option><option value="ally">Ally</option></select>
     <button id="spawn">Spawn</button></div>
 
-  <h4>4. Enemy moves</h4>
+  </details>
+
+  <details>
+  <summary>Enemy moves</summary>
   <div class="hint">The AI suggests where enemies and NPCs should go. Nothing moves until you press Apply.</div>
   <div class="line"><input type="text" id="situation" placeholder="Optional note (e.g. goblins are scared of fire)"></div>
   <div class="line"><button id="suggest">Suggest moves</button><button id="applyAll" class="alt" hidden>Apply all</button></div>
   <div id="moves"></div>
 
-  <h4>5. Monster stat blocks (only you see these)</h4>
+  </details>
+
+  <details>
+  <summary>Monster stat blocks (only you see these)</summary>
   <div class="hint">The DM automatically gets the official stats for monsters on the map and in your built adventure. This shows what it gets. 2024 rules first, 2014 if a monster isn't in the 2024 rules yet.</div>
   <div class="line"><button id="statsBtn" class="alt">Show stat blocks</button></div>
   <pre id="stats"></pre>
   <div class="hint">Stat data from the D&amp;D System Reference Documents 5.1 and 5.2 by Wizards of the Coast LLC (CC BY 4.0, dndbeyond.com/srd), via the free Open5e API.</div>
 
-  <h4>Housekeeping</h4>
+  </details>
+
+  <details>
+  <summary>Housekeeping</summary>
   <div class="line"><button id="clearBtn" class="alt">Clear story</button></div>
+  </details>
 </div>
 </div>
 
@@ -175,7 +271,7 @@ function md(t) {
 function add(cls, text) {
   const d = document.createElement("div");
   d.className = "msg " + cls;
-  if (cls === "dm") d.innerHTML = md(text); else d.textContent = text;
+  if (cls === "dm" || cls === "roll") d.innerHTML = md(text); else d.textContent = text;
   log.appendChild(d);
   log.scrollTop = log.scrollHeight;
 }
@@ -231,7 +327,7 @@ async function tryRestore() {
     if (list.length) {
       await api("/api/restore", {
         room: roomId, epoch: e,
-        msgs: list.map((m) => ({ role: m.r === "d" ? "dm" : "player", who: m.w, text: m.t })),
+        msgs: list.map((m) => ({ role: { d: "dm", r: "roll", s: "sys" }[m.r] || "player", who: m.w, text: m.t })),
       });
       setTimeout(fetchLog, 300);
     }
@@ -253,13 +349,17 @@ async function fetchLog() {
     } else {
       for (const m of d.msgs) {
         last = m.id;
-        add(m.role === "dm" ? "dm" : "you", m.role === "dm" ? m.text : `${m.who}: ${m.text}`);
-        msgCache.push({ r: m.role === "dm" ? "d" : "p", w: m.who, t: m.text });
+        if (m.role === "dm") add("dm", m.text);
+        else if (m.role === "roll") add("roll", `\u{1F3B2} ${m.who} ${m.text}`);
+        else if (m.role === "sys") add("table", m.text);
+        else add("you", `${m.who}: ${m.text}`);
+        msgCache.push({ r: { dm: "d", roll: "r", sys: "s" }[m.role] || "p", w: m.who, t: m.text });
       }
       if (d.msgs.length) scheduleSave();
     }
     serverBusy = d.busy;
     lastErr = "";
+    renderCombat(d.combat || null);
     if (d.latest === 0) tryRestore();
     if (isGmRole && Array.isArray(d.actions)) handleActions(d.actions);
   } catch (e) {
@@ -405,8 +505,8 @@ function busyBtn(btn, label, fn) {
   });
 }
 
-$("gmToggle").addEventListener("click", () => { $("story").hidden = true; $("gm").hidden = false; });
-$("gmBack").addEventListener("click", () => { $("gm").hidden = true; $("story").hidden = false; });
+$("gmToggle").addEventListener("click", () => showScreen("gm"));
+$("gmBack").addEventListener("click", () => showScreen("story"));
 
 busyBtn($("gmUnlock"), "Checking...", async () => {
   store("gmcode", $("gmcode").value);
@@ -420,9 +520,17 @@ busyBtn($("gmUnlock"), "Checking...", async () => {
     $("brief").value = d.brief || "";
     gmStatus("Unlocked.");
   }
+  try {
+    const srv = (await api("/api/gm/adv", { room: roomId }, true)).adv;
+    if (srv && srv.spec) { advSet(srv); store("map-" + roomId, JSON.stringify(srv.spec)); } // the server's copy wins (it may come from another device)
+  } catch (e) {}
   const m = savedMap();
   if (m) $("legend").textContent = layoutText(m);
   if (advGet()) { renderRooms(); try { await syncAdv(); } catch (e) {} }
+  try { await loadCampaign(); } catch (e) {}
+  const el = $("gmstatus");
+  el.textContent += d.db ? (d.dbErr ? " Warning: the last save to the database failed (" + d.dbErr + ")." : " Your game is saved to the database.")
+    : " No database is set up, so the game lives in memory until the server restarts.";
 });
 
 busyBtn($("draft"), "Drafting...", async () => {
@@ -542,7 +650,7 @@ async function syncAdv() {
   const adv = advGet();
   if (!adv) return;
   const creatures = [...new Set((adv.tokens || []).map((t) => String(t.name).replace(/\s+\d+$/, "")))];
-  await api("/api/gm/state", { room: roomId, layout: layoutText(adv.spec), areas: adv.spec.areas.map((a) => a.name), revealed: adv.revealed, creatures }, true);
+  await api("/api/gm/state", { room: roomId, layout: layoutText(adv.spec), areas: adv.spec.areas.map((a) => a.name), revealed: adv.revealed, creatures, full: adv }, true);
 }
 
 // Covers every cell that is NOT a revealed area with solid "rock", so the painted art only shows inside revealed rooms.
@@ -866,6 +974,224 @@ $("clearBtn").addEventListener("click", async () => {
   catch (e) { gmStatus("Problem: " + e.message); }
 });
 
+
+// For risky buttons: the first press only warns; a second press within 4 seconds goes ahead.
+function twice(btn, warning) {
+  if (btn.dataset.armed) { delete btn.dataset.armed; return true; }
+  btn.dataset.armed = "1";
+  gmStatus(warning);
+  setTimeout(() => { delete btn.dataset.armed; }, 4000);
+  return false;
+}
+
+/* ---------- screens ---------- */
+function showScreen(id) {
+  for (const s of ["story", "gm", "charScreen"]) $(s).hidden = s !== id;
+}
+
+/* ---------- dice ---------- */
+async function roll(text) {
+  text = String(text || "").trim();
+  if (!text) return;
+  try { await api("/api/roll", { room: roomId, who: myName, text }); $("dice").value = ""; }
+  catch (e) { add("sys", "Roll: " + e.message); }
+}
+$("rollBtn").addEventListener("click", () => roll($("dice").value));
+$("dice").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); roll($("dice").value); } });
+document.querySelectorAll("[data-roll]").forEach((b) => b.addEventListener("click", () => {
+  const extra = $("dice").value.trim();
+  roll(b.dataset.roll + (extra && !/^[0-9d+\-]/i.test(extra) ? " " + extra : ""));
+}));
+
+/* ---------- my character ---------- */
+const CARD = { name: "cName", species: "cSpecies", cls: "cCls", level: "cLevel", maxHp: "cMaxHp", ac: "cAc", init: "cInitB", story: "cStory" };
+$("charToggle").addEventListener("click", async () => {
+  showScreen("charScreen");
+  $("charStatus").textContent = "Loading...";
+  try {
+    const d = await api(`/api/char?room=${encodeURIComponent(roomId)}&who=${encodeURIComponent(myName)}`);
+    const c = d.card || {};
+    for (const k in CARD) $(CARD[k]).value = c[k] ?? (k === "level" ? 1 : k === "init" ? 0 : "");
+    $("charStatus").textContent = d.card ? "This is your saved card." : "No card yet: fill it in and press Save character.";
+  } catch (e) { $("charStatus").textContent = "Problem: " + e.message; }
+});
+$("charBack").addEventListener("click", () => showScreen("story"));
+$("charSave").addEventListener("click", async () => {
+  const card = {};
+  for (const k in CARD) card[k] = $(CARD[k]).value;
+  if (!card.name.trim()) { $("charStatus").textContent = "Give your character a name first."; return; }
+  try {
+    await api("/api/char", { room: roomId, who: myName, card });
+    $("charStatus").textContent = "Saved. Your GM and the DM can see your character now.";
+  } catch (e) { $("charStatus").textContent = "Problem: " + e.message; }
+});
+
+/* ---------- combat tracker ---------- */
+let combat = null, combatKey = "";
+function renderCombat(c) {
+  const key = JSON.stringify(c);
+  if (key === combatKey) return;
+  combatKey = key;
+  combat = c;
+  const box = $("combat"), list = $("clist");
+  box.hidden = !c;
+  if (!c) return;
+  const fight = c.phase === "fight";
+  $("ctitle").textContent = fight ? `Combat · Round ${c.round}` : "Combat · roll initiative";
+  const me = c.list.find((x) => x.side === "pc" && ((x.owner && x.owner === myName) || (!x.owner && x.name === myName)));
+  $("cInit").hidden = !me || me.init !== null;
+  $("cBegin").hidden = !isGmRole || fight;
+  $("cNext").hidden = !isGmRole || !fight;
+  list.innerHTML = "";
+  c.list.forEach((x, i) => {
+    const row = document.createElement("div");
+    const down = x.side !== "pc" && (x.status === "Down" || (x.maxHp > 0 && x.hp <= 0));
+    row.className = "crow" + (fight && i === c.turn ? " now" : "") + (down ? " down" : "");
+    const ini = document.createElement("span");
+    ini.className = "ci";
+    ini.textContent = x.init === null || x.init === undefined ? "?" : x.init;
+    const nm = document.createElement("span");
+    nm.className = "cn " + x.side;
+    nm.textContent = (fight && i === c.turn ? "▶ " : "") + x.name;
+    row.append(ini, nm);
+    const mine = x === me;
+    if (x.hp !== undefined && (isGmRole || mine)) {
+      // GM can edit everyone; a player edits their own HP
+      const hp = document.createElement("input");
+      hp.type = "number"; hp.min = 0; hp.value = x.hp; hp.title = "Current HP";
+      hp.addEventListener("change", async () => {
+        try {
+          if (isGmRole) await api("/api/gm/combat/set", { room: roomId, id: x.id, hp: +hp.value }, true);
+          else await api("/api/combat/hp", { room: roomId, who: myName, hp: +hp.value });
+        } catch (e) { add("sys", "HP: " + e.message); }
+      });
+      const of = document.createElement("span");
+      of.textContent = x.maxHp ? `/${x.maxHp}` + (x.ac ? ` AC ${x.ac}` : "") : (x.ac ? `AC ${x.ac}` : "");
+      row.append(hp, of);
+      if (isGmRole && !fight) {
+        const ii = document.createElement("input");
+        ii.type = "number"; ii.value = x.init ?? ""; ii.title = "Initiative (type a player's physical roll here)"; ii.placeholder = "init";
+        ii.addEventListener("change", () => api("/api/gm/combat/set", { room: roomId, id: x.id, init: ii.value }, true).catch((e) => add("sys", e.message)));
+        row.append(ii);
+      }
+    } else if (x.hp !== undefined) {
+      const t = document.createElement("span");
+      t.textContent = x.maxHp ? `${x.hp}/${x.maxHp}` : "";
+      row.append(t);
+    } else {
+      const t = document.createElement("span");
+      t.textContent = x.status || "";
+      row.append(t);
+    }
+    list.appendChild(row);
+  });
+  const now = list.querySelector(".now");
+  if (now) now.scrollIntoView({ block: "nearest" });
+}
+$("cInit").addEventListener("click", async () => {
+  try { await api("/api/combat/init", { room: roomId, who: myName }); } catch (e) { add("sys", e.message); }
+});
+async function combatTurn(path, btns) {
+  btns.forEach((b) => { b.disabled = true; });
+  try {
+    const map = useMap.checked ? await mapContext() : "";
+    let creatures = [];
+    try { creatures = (await readTokens()).filter((t) => t.side !== "pc").map((t) => t.name); } catch (e) {}
+    status.textContent = "Next turn... (if it's the monsters' turn, the DM is thinking)";
+    await api(path, { room: roomId, map, creatures }, true);
+    status.textContent = "";
+  } catch (e) { status.textContent = ""; add("sys", "Combat: " + e.message); gmStatus("Problem: " + e.message); }
+  btns.forEach((b) => { b.disabled = false; });
+}
+const beginBtns = [$("cBegin"), $("cBegin2")], nextBtns = [$("cNext"), $("cNext2")];
+beginBtns.forEach((b) => b.addEventListener("click", () => combatTurn("/api/gm/combat/begin", beginBtns)));
+nextBtns.forEach((b) => b.addEventListener("click", () => combatTurn("/api/gm/combat/next", nextBtns)));
+busyBtn($("cStart"), "Starting...", async () => {
+  if (combat && !twice($("cStart"), "A combat is already running. Press Start combat again within 4 seconds to replace it.")) return;
+  const tokens = await readTokens();
+  await api("/api/gm/combat/start", { room: roomId, tokens: tokens.map((t) => ({ id: t.id, name: t.name, side: t.side })) }, true);
+  gmStatus("Combat started. Players roll initiative on the story screen; press Begin round 1 when ready.");
+});
+let endArmed = false;
+$("cEnd").addEventListener("click", async () => {
+  if (!endArmed) { endArmed = true; $("cEnd").textContent = "Really end?"; setTimeout(() => { endArmed = false; $("cEnd").textContent = "End combat"; }, 4000); return; }
+  endArmed = false; $("cEnd").textContent = "End combat";
+  try { await api("/api/gm/combat/end", { room: roomId }, true); gmStatus("Combat ended. Players' HP is kept on their cards."); }
+  catch (e) { gmStatus("Problem: " + e.message); }
+});
+
+/* ---------- campaign (GM) ---------- */
+let camp = {};
+function renderCampaign(d) {
+  camp = d.campaign || {};
+  const chars = d.chars || {};
+  const names = Object.keys(chars);
+  $("party").textContent = names.length
+    ? names.map((p) => { const c = chars[p]; return `${c.name || "?"}: ${[c.species, c.cls].filter(Boolean).join(" ")} ${c.level}, HP ${c.hp}/${c.maxHp}, AC ${c.ac} (${p})`; }).join("\n")
+    : "No character cards yet. Players fill them in with My character.";
+  if (camp.world !== undefined && !$("world").value) $("world").value = camp.world;
+  if (camp.sessions) $("cSessions").value = camp.sessions;
+  if (camp.bible !== undefined) $("bible").value = camp.bible;
+  $("intro").textContent = camp.intro ? "Opening narration (players haven't seen it yet unless you posted it):\n" + camp.intro : "";
+  $("introBtn").hidden = !camp.intro;
+  $("recapBtn").hidden = !(camp.recaps && camp.recaps.length);
+  $("sessNo").textContent = camp.session || 1;
+}
+async function loadCampaign() {
+  const d = await api("/api/gm/campaign", { room: roomId }, true);
+  renderCampaign(d);
+  return d;
+}
+busyBtn($("partyBtn"), "Loading...", async () => { await loadCampaign(); gmStatus("Party refreshed."); });
+busyBtn($("campSave"), "Saving...", async () => {
+  const d = await api("/api/gm/campaign/save", { room: roomId, world: $("world").value, bible: $("bible").value, sessions: +$("cSessions").value }, true);
+  camp = d.campaign;
+  gmStatus("Campaign notes saved. The DM uses them from the next Ask DM.");
+});
+busyBtn($("campBuild"), "Building...", async () => {
+  if (!$("world").value.trim()) throw new Error("Describe your world idea first.");
+  if ($("bible").value.trim() && !twice($("campBuild"), "You already have campaign notes. Press Build campaign again within 4 seconds to replace them.")) return;
+  gmStatus("The AI is writing the campaign (world, factions, villain, session arc, a hook for each character). This can take a minute...");
+  const d = await api("/api/gm/campaign/build", { room: roomId, world: $("world").value, sessions: +$("cSessions").value }, true);
+  renderCampaign({ campaign: d.campaign, chars: (await api("/api/gm/campaign", { room: roomId }, true)).chars });
+  gmStatus("Campaign ready. Read and edit the notes (then Save notes). When the players are ready, post the intro, then press Prep next session only to draft session 1's brief.");
+});
+busyBtn($("introBtn"), "Posting...", async () => { await api("/api/gm/campaign/intro", { room: roomId }, true); gmStatus("Intro posted to the story."); });
+busyBtn($("recapBtn"), "Posting...", async () => {
+  const r = (camp.recaps || [])[camp.recaps.length - 1];
+  if (!r) throw new Error("No recap yet.");
+  await api("/api/say", { room: roomId, who: "Previously", text: `Session ${r.n} recap: ${r.text}` });
+  gmStatus("Last recap posted to the story.");
+});
+async function prepNext() {
+  gmStatus(`Drafting the brief for session ${camp.session || 1} (this can take a minute)...`);
+  const d = await api("/api/gm/campaign/prep", { room: roomId, note: $("prepNote").value, players: +$("plr").value }, true);
+  $("brief").value = d.text;
+  store("brief-" + roomId, d.text);
+  $("briefSec").open = true;
+  gmStatus(`Session ${camp.session || 1} brief is ready and saved in Session brief. Edit it if you like, then Build map + monsters when you're ready to play.`);
+}
+busyBtn($("prepOnly"), "Drafting...", prepNext);
+let sessArmed = false;
+$("endSess").addEventListener("click", async () => {
+  const b = $("endSess");
+  if (!sessArmed) {
+    sessArmed = true; b.textContent = "Really end the session?";
+    gmStatus("Press again within 4 seconds. The AI writes a recap (posted to the story), updates your campaign notes and drafts the next session's brief (2 AI requests).");
+    setTimeout(() => { sessArmed = false; b.textContent = "End session: recap + prep next"; }, 4000);
+    return;
+  }
+  sessArmed = false; b.disabled = true; b.textContent = "Working...";
+  try {
+    gmStatus("Step 1 of 2: writing the recap and updating your notes...");
+    const d = await api("/api/gm/campaign/end", { room: roomId }, true);
+    renderCampaign({ campaign: d.campaign, chars: (await api("/api/gm/campaign", { room: roomId }, true)).chars });
+    gmStatus("Step 2 of 2: drafting the next session...");
+    await prepNext();
+  } catch (e) { gmStatus("Problem: " + e.message); }
+  b.disabled = false; b.textContent = "End session: recap + prep next";
+});
+
 /* ---------- AI actions (GM approves, camera auto-runs) ---------- */
 const handled = new Set();
 let pendingActions = [], shownKey = "", lastTokens = [];
@@ -881,6 +1207,8 @@ function describe(a) {
   if (a.type === "fog") return a.on ? "Cover the scene in fog" : "Clear the fog";
   if (a.type === "light") return `Give ${a.name} a light (${a.radius} cells)`;
   if (a.type === "reveal") return `Reveal "${a.area}" on the map`;
+  if (a.type === "damage") return `${a.name} takes ${a.amount} damage`;
+  if (a.type === "heal") return `${a.name} regains ${a.amount} HP`;
   return a.type;
 }
 
@@ -940,6 +1268,8 @@ async function broadcast(channel, data, fallback) {
 }
 
 async function runAction(a) {
+  if (a.type === "damage" || a.type === "heal") // only the tracker changes; nothing on the map
+    return api("/api/gm/combat/hp", { room: roomId, name: a.name, delta: a.type === "damage" ? -a.amount : a.amount }, true);
   if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room.");
   await ready;
   const tokens = await readTokens();

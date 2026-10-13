@@ -1,8 +1,8 @@
 {
   "name": "AI Dungeon Master",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "manifest_version": 1,
-  "description": "An AI DM that narrates, drafts one-shots, draws maps and suggests enemy moves.",
+  "description": "An AI DM that narrates, runs combat, builds campaigns and maps, and suggests enemy moves.",
   "author": "You",
   "icon": "/icon.svg",
   "action": {
@@ -10,6 +10,6 @@
     "icon": "/icon.svg",
     "popover": "/index.html",
     "width": 440,
-    "height": 640
+    "height": 700
   }
 }

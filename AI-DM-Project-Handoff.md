@@ -15,7 +15,7 @@
 - **Node server** (`server.js`, zero npm dependencies, Node 18+) hosted on Render free tier. Serves the 3 static files and a JSON API. Calls the Gemini REST API (`generateContent`).
 - **Shared story:** one in-memory log per Owlbear room (resets when Render restarts or sleeps). Players press **Say** (adds a message, no AI call). One person presses **Ask DM** (one Gemini request for the whole round). Client polls `/api/log` every 3 seconds.
 - **Two passwords (Render env vars):** `ACCESS_CODE` (all players, entered in the panel's "Access code" box on the story screen) and `GM_CODE` (GM only, entered in the GM tools screen). They must be different. Server enforces both. Common confusion: the error "Wrong or missing access code" means the ACCESS code box, not the GM code.
-- **Render env vars:** `GEMINI_API_KEY` (required), `ACCESS_CODE`, `GM_CODE`, optional `POLLINATIONS_KEY` (free image key), `MODEL` (live story model; user currently has `gemini-3.8-flash`), optional `PLAN_MODEL` (model for one-shots, maps, moves; defaults to MODEL).
+- **Render env vars:** `GEMINI_API_KEY` (required), `ACCESS_CODE`, `GM_CODE`, optional `POLLINATIONS_KEY` (free image key), optional `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` (free database), `MODEL` (live story model; user currently has `gemini-3.8-flash`), optional `PLAN_MODEL` (model for one-shots, maps, moves; defaults to MODEL).
 - Repo files (all in repo root, flat, exact names): `index.html`, `manifest.json`, `icon.svg`, `server.js`, `package.json`. Render settings: Node, build `npm install`, start `npm start`, Free instance.
 
 ## 3. Features built
@@ -96,7 +96,7 @@ No LICENSE file is in the ZIP, so do NOT copy their code or art assets. Use it o
 **Implications for our steps:** Step 2 (history): store a TRIMMED copy in room metadata (their unbounded array is a known risk); never store the brief there. Step 3 (actions): use their action list as the checklist, run with GM approval, bundled in the Ask DM request. Step 4 (fog): only whole-scene fog on/off and token lights are proven; fine-grained reveals need FOG-layer items, unverified. Step 7 (map art): `insertMap` approach is proven; we still need a free image source and hosting.
 
 ## 7. Full source code (current)
-Create each file with exactly these contents (current version: v0.6.2). `icon.svg` and `package.json` are unchanged since the first version.
+Create each file with exactly these contents (current version: v0.7.0). `icon.svg` and `package.json` are unchanged since the first version.
 
 ### package.json
 
@@ -116,9 +116,9 @@ Create each file with exactly these contents (current version: v0.6.2). `icon.sv
 ```json
 {
   "name": "AI Dungeon Master",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "manifest_version": 1,
-  "description": "An AI DM that narrates, drafts one-shots, draws maps and suggests enemy moves.",
+  "description": "An AI DM that narrates, runs combat, builds campaigns and maps, and suggests enemy moves.",
   "author": "You",
   "icon": "/icon.svg",
   "action": {
@@ -126,7 +126,7 @@ Create each file with exactly these contents (current version: v0.6.2). `icon.sv
     "icon": "/icon.svg",
     "popover": "/index.html",
     "width": 440,
-    "height": 640
+    "height": 700
   }
 }
 ```
@@ -162,7 +162,8 @@ const FILES = {
 const SYSTEM_PROMPT = `You are the Dungeon Master for a group of several players playing Dungeons & Dragons using the 2024 (5.5e) rules.
 - Narrate vividly but keep each reply under about 250 words.
 - Play NPCs and monsters in character. Stay consistent with what has already happened in this chat.
-- You cannot roll dice. When a roll is needed, tell the players exactly what to roll (e.g. "Roll a DC 13 Dexterity save") and wait for the results.
+- Never roll for the players: when they need a roll, tell them exactly what to roll (e.g. "Roll a DC 13 Dexterity save") and wait. They roll in the panel and their results appear in the story as "rolls ...".
+- For monsters and NPCs, use the PRE-ROLLED DICE list, in order, for every attack, save and damage roll, and show the math briefly. Never invent dice results.
 - If you are not sure about a rule, say so and give your best ruling instead of inventing an exact rule.
 - If MONSTER STAT BLOCKS are provided, use those exact numbers for attacks, damage, saves and abilities. Never tell players a monster's exact HP, AC or stat numbers; describe how hurt it looks instead.
 - Each player message begins with that player's name. Several players may act in one round: respond to all of them, addressing players by name.
@@ -217,6 +218,7 @@ OUTPUT FORMAT: reply with ONLY valid JSON: {"narration": string, "actions": [ ..
 - For move, delete, camera and light, use a token's EXACT name from the map snapshot (for example "Goblin Warrior 2").
 - Do NOT spawn creatures that are already on the map snapshot, and do NOT spawn the creatures of a hidden area: they appear automatically when that area is revealed, so use "reveal" instead. Only spawn genuinely new arrivals (reinforcements, summons, a newly introduced NPC).
 - Never move a creature onto a cell that another token occupies.
+- At most 6 actions, but damage and heal do not count toward that limit (up to 12 of them).
 - Action types:
   {"type":"spawn","name":"Goblin","count":3,"side":"enemy"|"npc"|"ally","col":int,"row":int}   (creatures that enter the scene now)
   {"type":"move","name":"Goblin 1","col":int,"row":int,"reason":"short"}   (only enemy/npc/ally tokens, never player characters)
@@ -224,14 +226,19 @@ OUTPUT FORMAT: reply with ONLY valid JSON: {"narration": string, "actions": [ ..
   {"type":"fog","on":true|false}   (true = cover the whole scene in fog, false = clear it)
   {"type":"camera","name":"Cult Leader"}  or  {"type":"camera","col":int,"row":int}   (focus everyone's view)
   {"type":"light","name":"Ann","radius":4}   (give a token a light, radius in cells)
-  {"type":"reveal","area":"Scene 2: Altar Hall"}   (make a hidden area, and the creatures in it, appear on the map when the party reaches, opens or discovers it)`;
+  {"type":"reveal","area":"Scene 2: Altar Hall"}   (make a hidden area, and the creatures in it, appear on the map when the party reaches, opens or discovers it)
+  {"type":"damage","name":"Goblin Warrior 1","amount":7}   (a creature or character in the combat tracker loses HP)
+  {"type":"heal","name":"Ann","amount":5}   (a creature or character in the combat tracker regains HP)`;
 
 function sanitizeActions(list) {
   const out = [];
-  for (const a of (Array.isArray(list) ? list : []).slice(0, 6)) {
+  let count = 0;
+  for (const a of (Array.isArray(list) ? list : []).slice(0, 30)) {
     if (!a || typeof a !== "object") continue;
     const type = str(a.type, 12);
     const name = str(a.name, 40);
+    if (type === "damage" || type === "heal") continue;
+    if (++count > 6) break;
     if (type === "spawn" && name)
       out.push({ type, name: baseName(name) || name, count: clampInt(a.count, 1, 12, 1), side: ["enemy", "npc", "ally"].includes(a.side) ? a.side : "enemy", col: clampInt(a.col, 0, 200, 0), row: clampInt(a.row, 0, 200, 0) });
     else if (type === "move" && name)
@@ -243,6 +250,13 @@ function sanitizeActions(list) {
     else if (type === "light" && name) out.push({ type, name, radius: clampInt(a.radius, 1, 12, 3) });
     else if (type === "reveal" && str(a.area, 60)) out.push({ type, area: str(a.area, 60) });
   }
+  // damage / heal are bookkeeping for the combat tracker, so they get their own (larger) allowance
+  for (const a of (Array.isArray(list) ? list : []).slice(0, 30)) {
+    if (!a || typeof a !== "object") continue;
+    const type = str(a.type, 12), name = str(a.name, 40);
+    if ((type === "damage" || type === "heal") && name && out.filter((x) => x.type === "damage" || x.type === "heal").length < 12)
+      out.push({ type, name, amount: clampInt(a.amount, 1, 500, 1) });
+  }
   return out;
 }
 
@@ -250,7 +264,7 @@ function sanitizeActions(list) {
 const rooms = {};
 function getRoom(id) {
   id = String(id || "default").slice(0, 100);
-  if (!rooms[id]) rooms[id] = { id, msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1, adv: null, art: null, artV: 0, epoch: "" };
+  if (!rooms[id]) rooms[id] = { id, msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1, adv: null, advFull: null, art: null, artV: 0, epoch: "", chars: {}, campaign: null, combat: null };
   return rooms[id];
 }
 function addMsg(r, role, who, text) {
@@ -275,6 +289,138 @@ function openStream(req, res, r) {
   const beat = setInterval(() => { try { res.write(": ping\n\n"); } catch (e) {} }, 20000);
   req.on("close", () => { clearInterval(beat); set.delete(res); if (!set.size) delete streams[r.id]; });
 }
+// ---------- Database (optional, free Upstash Redis via its REST API) ----------
+// With UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN set, every room is saved there, so the story, brief, map,
+// combat, campaign and characters survive restarts. Without them, everything stays in memory like before.
+const DB_URL = (process.env.UPSTASH_REDIS_REST_URL || "").trim().replace(/\/+$/, "");
+const DB_TOKEN = (process.env.UPSTASH_REDIS_REST_TOKEN || "").trim();
+const DB_ON = !!(DB_URL && DB_TOKEN);
+const SAVE_FIELDS = ["msgs", "next", "brief", "epoch", "adv", "advFull", "combat", "campaign", "chars", "aseq"];
+async function db(cmd) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const resp = await fetch(DB_URL, {
+      method: "POST", signal: ctrl.signal,
+      headers: { Authorization: "Bearer " + DB_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify(cmd),
+    });
+    const d = await resp.json().catch(() => ({}));
+    if (!resp.ok || d.error) throw new Error("Database error: " + (d.error || resp.status));
+    return d.result;
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error("The database didn't answer in time.");
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function touch(r) {
+  if (!DB_ON || !r || !r.loaded) return;
+  clearTimeout(r.saveT);
+  r.saveT = setTimeout(() => saveRoom(r), 1500);
+}
+async function saveRoom(r) {
+  const o = {};
+  SAVE_FIELDS.forEach((k) => { o[k] = r[k]; });
+  try {
+    await db(["SET", "aidm:room:" + r.id, JSON.stringify(o), "EX", String(180 * 86400)]); // kept 180 days after last change
+    r.dbErr = "";
+  } catch (e) {
+    r.dbErr = e.message;
+    console.error("save", r.id, e.message);
+  }
+}
+const loading = {};
+// Gets a room, loading it from the database the first time. If the database can't be read, the request fails
+// (instead of starting an empty room that would overwrite the saved one).
+async function loadRoom(id) {
+  id = String(id || "default").slice(0, 100);
+  if (rooms[id] && rooms[id].loaded) return rooms[id];
+  if (!DB_ON) { const r = getRoom(id); r.loaded = true; return r; }
+  if (!loading[id]) {
+    loading[id] = (async () => {
+      let raw;
+      try { raw = await db(["GET", "aidm:room:" + id]); }
+      catch (e) { throw new Error("Couldn't read the saved game from the database (" + e.message + "). Try again in a moment."); }
+      const r = getRoom(id);
+      if (!r.loaded) {
+        if (raw) {
+          try {
+            const saved = JSON.parse(raw);
+            SAVE_FIELDS.forEach((k) => { if (saved[k] !== undefined && saved[k] !== null) r[k] = saved[k]; });
+          } catch (e) { console.error("bad saved room", id); }
+        }
+        r.loaded = true;
+      }
+      return r;
+    })().finally(() => { delete loading[id]; });
+  }
+  return loading[id];
+}
+
+// ---------- Dice (rolled on the server, so everyone sees the same fair result) ----------
+const crypto = require("crypto");
+const die = (sides) => crypto.randomInt(1, sides + 1);
+function rollDice(expr) {
+  let s = String(expr || "").toLowerCase().replace(/\s+/g, "");
+  if (s === "adv") s = "2d20kh1";
+  if (s === "dis") s = "2d20kl1";
+  if (!s || s.length > 60) throw new Error("Write a roll like 1d20+5, 2d6+3, adv or dis.");
+  const re = /([+-])?(?:(\d*)d(\d+)(kh1|kl1|adv|dis)?|(\d+))/y;
+  let pos = 0, total = 0, terms = 0, dice = 0, nat = 0;
+  const parts = [];
+  while (pos < s.length) {
+    re.lastIndex = pos;
+    const m = re.exec(s);
+    if (!m || !m[0]) throw new Error(`I can't read "${expr}". Write a roll like 1d20+5.`);
+    pos = re.lastIndex;
+    if (++terms > 10) throw new Error("That roll has too many parts.");
+    const neg = m[1] === "-";
+    const join = parts.length ? (neg ? "- " : "+ ") : (neg ? "-" : "");
+    if (m[3] !== undefined) {
+      let n = m[2] === "" ? 1 : +m[2];
+      const sides = +m[3];
+      let mode = m[4] || "";
+      if (mode === "adv") mode = "kh1";
+      if (mode === "dis") mode = "kl1";
+      if (mode) n = Math.max(n, 2);
+      if (n < 1 || n > 50 || sides < 2 || sides > 1000) throw new Error("Use 1 to 50 dice with 2 to 1000 sides.");
+      dice += n;
+      const rolls = Array.from({ length: n }, () => die(sides));
+      let val;
+      if (mode === "kh1") val = Math.max(...rolls);
+      else if (mode === "kl1") val = Math.min(...rolls);
+      else val = rolls.reduce((a, b) => a + b, 0);
+      if (sides === 20 && (n === 1 || mode) && !nat) nat = val;
+      parts.push(join + `[${rolls.join(", ")}${mode ? " → " + val : ""}]`);
+      total += neg ? -val : val;
+    } else {
+      parts.push(join + m[5]);
+      total += neg ? -m[5] : +m[5];
+    }
+  }
+  if (!dice) throw new Error("Include at least one die, like 1d20.");
+  return { total, detail: parts.join(" "), nat };
+}
+// "1d20+5 attack with sword" -> roll "1d20+5", label "attack with sword"
+function splitRoll(text) {
+  const words = String(text || "").trim().split(/\s+/);
+  const dice = [];
+  while (words.length && /^([0-9d+\-]+|kh1|kl1|adv|dis|[0-9d+\-]+(kh1|kl1))$/i.test(words[0])) dice.push(words.shift());
+  return { expr: dice.join(""), label: words.join(" ").slice(0, 60) };
+}
+function rollText(expr, label, res) {
+  return `rolls ${expr}${label ? " for " + label : ""}: ${res.detail} = **${res.total}**` +
+    (res.nat === 20 ? " (natural 20!)" : res.nat === 1 ? " (natural 1)" : "");
+}
+// A list of pre-rolled dice the AI must use, in order, for monsters and NPCs (it cannot roll by itself).
+function diceBank() {
+  const row = (sides, n) => `d${sides}: ` + Array.from({ length: n }, () => die(sides)).join(", ");
+  return "\n\nPRE-ROLLED DICE for monsters and NPCs (use them in order, never reuse one, never invent results):\n" +
+    [row(20, 12), row(4, 8), row(6, 12), row(8, 10), row(10, 8), row(12, 6)].join("\n");
+}
+
 
 function headers(type) {
   return {
@@ -363,7 +509,7 @@ function buildContents(msgs) {
   const contents = [];
   for (const m of msgs.slice(-40)) {
     const role = m.role === "dm" ? "model" : "user";
-    const text = m.role === "dm" ? m.text : `${m.who}: ${m.text}`;
+    const text = m.role === "dm" ? m.text : m.role === "sys" ? `[Table] ${m.text}` : `${m.who}: ${m.text}`;
     const last = contents[contents.length - 1];
     if (last && last.role === role) last.parts[0].text += "\n" + text;
     else contents.push({ role, parts: [{ text }] });
@@ -586,6 +732,230 @@ function layoutText(m) {
   );
 }
 
+
+// ---------- Combat tracker ----------
+// r.combat = { phase: "setup"|"fight", round, turn, v, list: [{ id, name, side, owner, init, initBonus, hp, maxHp, ac }] }
+const alive = (c) => c.side === "pc" || !(c.maxHp > 0) || c.hp > 0;
+function combatBump(r) { if (r.combat) r.combat.v = (r.combat.v || 0) + 1; }
+function healthWord(c) {
+  if (!(c.maxHp > 0)) return "";
+  if (c.hp <= 0) return "Down";
+  return c.hp <= c.maxHp / 2 ? "Bloodied" : "Healthy";
+}
+// Players see monsters' health as a word; the GM sees the numbers.
+function combatView(r, gm) {
+  const c = r.combat;
+  if (!c) return null;
+  return {
+    phase: c.phase, round: c.round, turn: c.turn, v: c.v || 0,
+    list: c.list.map((x) => (gm || x.side === "pc")
+      ? { id: x.id, name: x.name, side: x.side, owner: x.owner || "", init: x.init, hp: x.hp, maxHp: x.maxHp, ac: x.ac }
+      : { id: x.id, name: x.name, side: x.side, init: x.init, status: healthWord(x) }),
+  };
+}
+function combatBlock(r) {
+  const c = r.combat;
+  if (!c) return "";
+  const rows = c.list.map((x, i) =>
+    `${i + 1}. ${x.name} (${x.side === "pc" ? "player character" : x.side}) initiative ${x.init === null ? "?" : x.init}` +
+    (x.maxHp > 0 ? `, HP ${x.hp}/${x.maxHp}` : "") + (x.ac ? `, AC ${x.ac}` : "") + (!alive(x) ? ", DOWN" : "") +
+    (c.phase === "fight" && i === c.turn ? "  <- current turn" : ""));
+  return `\n\nCOMBAT IS ON (${c.phase === "setup" ? "rolling initiative" : "round " + c.round}). Turn order:\n` + rows.join("\n") +
+    "\nWhen a hit or healing changes a creature's HP, propose a damage or heal action for it so the GM can update the tracker.";
+}
+function findCombatant(r, name) {
+  const c = r.combat;
+  if (!c) return null;
+  const low = (s) => String(s || "").toLowerCase().trim();
+  const exact = c.list.filter((x) => low(x.name) === low(name));
+  if (exact.length === 1) return exact[0];
+  const base = c.list.filter((x) => low(baseName(x.name)) === low(baseName(name)));
+  return base.length === 1 ? base[0] : null;
+}
+function sortCombat(r) {
+  const c = r.combat;
+  const current = c.list[c.turn] && c.list[c.turn].id;
+  c.list.sort((a, b) => (b.init ?? -99) - (a.init ?? -99) || (b.initBonus || 0) - (a.initBonus || 0) || (a.side === "pc" ? -1 : 1));
+  const i = c.list.findIndex((x) => x.id === current);
+  c.turn = i >= 0 ? i : 0;
+}
+async function startCombat(r, tokens) {
+  const list = [];
+  const chars = r.chars || {};
+  for (const owner of Object.keys(chars)) {
+    const ch = chars[owner];
+    list.push({ id: "pc:" + owner, name: ch.name || owner, side: "pc", owner, init: null, initBonus: ch.init || 0,
+      maxHp: ch.maxHp || 0, hp: ch.hp ?? ch.maxHp ?? 0, ac: ch.ac || 0 });
+  }
+  const known = new Set(list.map((x) => x.name.toLowerCase()));
+  const toks = (Array.isArray(tokens) ? tokens : []).slice(0, 40);
+  // Player tokens with no character card still get a row (no HP until someone types it in).
+  for (const t of toks.filter((t) => t.side === "pc")) {
+    const name = str(t.name, 40);
+    if (name && !known.has(name.toLowerCase())) { known.add(name.toLowerCase()); list.push({ id: "pc:" + name, name, side: "pc", owner: "", init: null, initBonus: 0, maxHp: 0, hp: 0, ac: 0 }); }
+  }
+  const lines = [];
+  for (const t of toks.filter((t) => ["enemy", "npc", "ally"].includes(t.side))) {
+    const name = str(t.name, 40);
+    if (!name) continue;
+    const hit = await lookupCreature(name).catch(() => null);
+    const d = (hit && hit.data) || {};
+    const bonus = Number(d.initiative_bonus) || (d.modifiers && Number(d.modifiers.dexterity)) || 0;
+    const roll = die(20);
+    list.push({ id: "t:" + str(t.id, 80), name, side: t.side, owner: "", init: roll + bonus, initBonus: bonus,
+      maxHp: Number(d.hit_points) || 0, hp: Number(d.hit_points) || 0, ac: Number(d.armor_class) || 0 });
+    lines.push(`${name} ${roll}${bonus ? (bonus > 0 ? "+" : "") + bonus : ""} = ${roll + bonus}`);
+  }
+  r.combat = { phase: "setup", round: 0, turn: 0, v: 1, list };
+  const pcs = list.filter((x) => x.side === "pc").map((x) => x.name);
+  addMsg(r, "sys", "Table", "⚔️ Combat! " + (pcs.length ? "Players, press Roll initiative: " + pcs.join(", ") + "." : "") +
+    (lines.length ? " Monster initiative: " + lines.join("; ") + "." : ""));
+}
+// Moves to the next creature that is still up. Returns false if nobody can act.
+function stepTurn(r) {
+  const c = r.combat;
+  for (let k = 0; k < c.list.length; k++) {
+    c.turn++;
+    if (c.turn >= c.list.length) { c.turn = 0; c.round++; }
+    if (alive(c.list[c.turn])) return true;
+  }
+  return false;
+}
+// The run of monsters/NPCs/allies (still up) that act in a row starting at the current turn.
+function monsterBlock(r) {
+  const c = r.combat, out = [];
+  let i = c.turn, n = 0;
+  while (n < c.list.length && c.list[i].side !== "pc") {
+    if (alive(c.list[i])) out.push(c.list[i]);
+    i = (i + 1) % c.list.length; n++;
+  }
+  return { list: out, steps: n };
+}
+
+// ---------- Characters and campaign ----------
+// r.chars = { [player name]: { name, species, cls, level, maxHp, hp, ac, init, story } }
+// r.campaign = { world, sessions, bible, intro, recaps: [], session }
+function cleanCard(c) {
+  c = c || {};
+  const maxHp = clampInt(c.maxHp, 0, 999, 0);
+  return {
+    name: str(c.name, 40), species: str(c.species, 30), cls: str(c.cls, 40), level: clampInt(c.level, 1, 20, 1),
+    maxHp, hp: clampInt(c.hp === undefined || c.hp === "" ? maxHp : c.hp, 0, 999, maxHp),
+    ac: clampInt(c.ac, 0, 40, 10), init: clampInt(c.init, -5, 20, 0), story: str(c.story, 1200),
+  };
+}
+function partyText(r) {
+  const chars = r.chars || {};
+  const rows = Object.keys(chars).map((p) => {
+    const c = chars[p];
+    return `- ${c.name || p} (played by ${p}): ${[c.species, c.cls].filter(Boolean).join(" ")} level ${c.level}, AC ${c.ac}, HP ${c.hp}/${c.maxHp}.` +
+      (c.story ? ` Backstory and goals: ${c.story}` : "");
+  });
+  return rows.join("\n");
+}
+function trimMiddle(t, head, tail) {
+  t = String(t || "");
+  return t.length <= head + tail ? t : t.slice(0, head) + "\n[...]\n" + t.slice(-tail);
+}
+function campaignBlock(r) {
+  const camp = r.campaign || {};
+  let out = "";
+  const party = partyText(r);
+  if (party) out += "\n\nTHE PARTY:\n" + party;
+  if (camp.bible) out += "\n\nSECRET CAMPAIGN NOTES (never quote; reveal only through play):\n" + trimMiddle(camp.bible, 3000, 1500);
+  const recaps = (camp.recaps || []).slice(-2);
+  if (recaps.length) out += "\n\nPREVIOUSLY (recaps of recent sessions):\n" + recaps.map((x) => `Session ${x.n}: ${x.text}`).join("\n");
+  return out;
+}
+const CAMPAIGN_SYSTEM = `You are an expert Dungeons & Dragons (2024, 5.5e) campaign designer. Output ONLY valid JSON: {"bible": string, "intro": string}.
+"bible" = secret GM campaign notes in plain text (no markdown symbols other than line breaks and dashes), under 1500 words, with these headings:
+PREMISE
+WORLD AND TONE (respect the GM's lines and veils)
+FACTIONS
+VILLAIN AND THEIR PLAN
+CAMPAIGN ARC (one short entry per session: goal, main location, big moment)
+PLAYER HOOKS (one per character, tied to their backstory and goals)
+RECURRING NPCS
+SECRETS AND CLUES
+"intro" = a player-facing opening narration for the first session, under 200 words, second person plural, no secrets.`;
+const RECAP_SYSTEM = `You keep the campaign log for a D&D (2024) game. Output ONLY valid JSON: {"recap": string, "notes": string}.
+"recap" = what happened this session, for the PLAYERS: under 220 words, past tense, no secrets they haven't discovered.
+"notes" = an update for the GM's secret campaign notes, under 300 words, plain text with dashes: what changed (NPC fates, clues found, threads opened or closed, villain's reaction), loot and levels gained, and 2-3 ideas for the next session.`;
+
+// Runs one DM turn: the story so far (+ an optional extra instruction) -> narration posted to the story + proposed actions queued for the GM.
+async function runDm(r, { map, creatures, instruction }) {
+  if (!API_KEY) throw new Error("Server has no GEMINI_API_KEY set.");
+  if (r.busy) { const e = new Error("The DM is already thinking."); e.status = 409; throw e; }
+  r.busy = true;
+  notify(r);
+  try {
+    const names = creatureNames(r, [...(creatures || []), ...(r.combat ? r.combat.list.filter((x) => x.side !== "pc").map((x) => x.name) : [])]);
+    const stats = await statsBlock(names);
+    const contents = buildContents(r.msgs);
+    if (instruction) {
+      const last = contents[contents.length - 1];
+      if (last && last.role === "user") last.parts[0].text += "\n" + instruction;
+      else contents.push({ role: "user", parts: [{ text: instruction }] });
+    }
+    let raw;
+    try {
+      raw = await gemini({
+        system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + campaignBlock(r) + advBlock(r) + stats + combatBlock(r) + diceBank() + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
+        contents,
+        json: true,
+        maxTokens: 6144,
+      });
+    } catch (e) {
+      if (!e.cutOff) throw e;
+      raw = e.text; // cut off near the end: keep whatever story text arrived
+    }
+    let narration = raw, actions = [];
+    try {
+      const p = parseJson(raw);
+      if (p && typeof p.narration === "string" && p.narration.trim()) {
+        narration = p.narration.trim();
+        actions = sanitizeActions(p.actions);
+      }
+    } catch (e) {
+      // Broken JSON: pull out just the story text so players never see raw code.
+      const m = raw.match(/"narration"\s*:\s*"((?:[^"\\]|\\.)*)/);
+      if (m) { try { narration = JSON.parse('"' + m[1] + '"'); } catch (x) { narration = m[1].replace(/\\n/g, "\n").replace(/\\"/g, '"'); } }
+    }
+    addMsg(r, "dm", "DM", narration);
+    actions.forEach((a) => r.pending.push({ id: r.aseq++, ...a }));
+    r.pending = r.pending.slice(-30);
+  } finally {
+    r.busy = false;
+    notify(r);
+  }
+}
+
+// After "Begin" or "Next turn": while it's the monsters' turn, run them (one AI request per run of monsters), then announce the next player.
+async function runMonsterTurns(r, opts) {
+  const c = r.combat;
+  if (!c.list.some((x) => x.side === "pc")) { addMsg(r, "sys", "Table", "There are no player characters in the turn order."); return; }
+  let guard = 0;
+  while (r.combat && c.list[c.turn].side !== "pc" && guard++ < 3) {
+    const block = monsterBlock(r);
+    if (block.list.length) {
+      const names = block.list.map((x) => x.name).join(", ");
+      addMsg(r, "sys", "Table", `Round ${c.round}: ${names} ${block.list.length > 1 ? "act" : "acts"}.`);
+      await runDm(r, {
+        ...opts,
+        instruction: `[Combat, round ${c.round}] It is now the turn of: ${names} (in this order). Run each one's turn now: ` +
+          `movement (propose move actions; never onto an occupied cell), then attacks, spells or abilities from its stat block. ` +
+          `Use the PRE-ROLLED DICE in order for every attack roll, save and damage roll, and show the math briefly ` +
+          `(for example "Scimitar: 14 + 4 = 18 vs AC 15, hit, 5 slashing damage"). Compare attack totals with the targets' AC from the turn order. ` +
+          `Propose a damage action for every creature in the turn order that takes damage. Do not act for player characters. End by naming whose turn is next.`,
+      });
+    }
+    for (let k = 0; k < block.steps; k++) { c.turn++; if (c.turn >= c.list.length) { c.turn = 0; c.round++; } }
+    if (!alive(c.list[c.turn])) stepTurn(r);
+  }
+  combatBump(r);
+  if (r.combat && c.list[c.turn].side === "pc") addMsg(r, "sys", "Table", `Round ${c.round}: it's ${c.list[c.turn].name}'s turn.`);
+}
+
 // ---------- API ----------
 function isGm(req) {
   return GM_CODE && req.headers["x-gm-code"] === GM_CODE;
@@ -602,21 +972,31 @@ async function handleApi(req, res, url, query) {
       return json(res, 401, { error: "Wrong or missing access code." });
 
     if (req.method === "GET" && url === "/api/log") {
-      const r = getRoom(query.get("room"));
+      const r = await loadRoom(query.get("room"));
       const since = parseInt(query.get("since") || "0", 10) || 0;
-      return json(res, 200, { msgs: r.msgs.filter((m) => m.id > since), latest: r.next - 1, epoch: r.epoch, busy: r.busy, ...(isGm(req) ? { actions: r.pending } : {}) });
+      const gm = isGm(req);
+      return json(res, 200, {
+        msgs: r.msgs.filter((m) => m.id > since), latest: r.next - 1, epoch: r.epoch, busy: r.busy,
+        combat: combatView(r, gm), ...(gm ? { actions: r.pending } : {}),
+      });
     }
-    if (req.method === "GET" && url === "/api/stream") return openStream(req, res, getRoom(query.get("room")));
+    if (req.method === "GET" && url === "/api/stream") return openStream(req, res, await loadRoom(query.get("room")));
+    if (req.method === "GET" && url === "/api/char") {
+      const r = await loadRoom(query.get("room"));
+      return json(res, 200, { card: (r.chars || {})[str(query.get("who"), 40)] || null });
+    }
     if (req.method === "GET" && url === "/api/gm/brief") {
       if (!needGm(req, res)) return;
-      return json(res, 200, { brief: getRoom(query.get("room")).brief });
+      const r = await loadRoom(query.get("room"));
+      return json(res, 200, { brief: r.brief, db: DB_ON, dbErr: r.dbErr || "" });
     }
     if (req.method !== "POST") return json(res, 404, { error: "Not found" });
 
     let body;
     try { body = JSON.parse(await readBody(req)); }
     catch (e) { return json(res, 400, { error: "Bad request." }); }
-    const r = getRoom(body.room);
+    const r = await loadRoom(body.room);
+    res.on("finish", () => touch(r)); // save the room after every change
 
     if (url === "/api/say") {
       const text = str(body.text, 1000);
@@ -627,47 +1007,54 @@ async function handleApi(req, res, url, query) {
     }
 
     if (url === "/api/dm") {
-      if (!API_KEY) return json(res, 500, { error: "Server has no GEMINI_API_KEY set." });
       if (r.busy) return json(res, 409, { error: "The DM is already thinking." });
       const lastMsg = r.msgs[r.msgs.length - 1];
       if (!lastMsg || lastMsg.role === "dm")
         return json(res, 400, { error: "Nothing new for the DM to respond to. Have players say what they do first." });
-      const map = str(body.map, 5000);
-      r.busy = true;
+      await runDm(r, { map: str(body.map, 5000), creatures: Array.isArray(body.creatures) ? body.creatures : [] });
+      return json(res, 200, { ok: true });
+    }
+
+    // ----- dice -----
+    if (url === "/api/roll") {
+      const who = str(body.who, 40) || "Player";
+      const { expr, label } = splitRoll(str(body.text, 120));
+      const res2 = rollDice(expr || str(body.text, 60));
+      addMsg(r, "roll", who, rollText(expr || str(body.text, 60), label, res2));
+      return json(res, 200, { ok: true, total: res2.total });
+    }
+
+    // ----- characters (each player edits their own card) -----
+    if (url === "/api/char") {
+      const who = str(body.who, 40);
+      if (!who) return json(res, 400, { error: "No player name." });
+      r.chars = r.chars || {};
+      if (body.card === null) delete r.chars[who];
+      else r.chars[who] = cleanCard(body.card);
       notify(r);
-      try {
-        const stats = await statsBlock(creatureNames(r, body.creatures));
-        let raw;
-        try {
-          raw = await gemini({
-          system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + advBlock(r) + stats + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
-          contents: buildContents(r.msgs),
-          json: true,
-          maxTokens: 6144,
-        });
-        } catch (e) {
-          if (!e.cutOff) throw e;
-          raw = e.text; // cut off near the end: keep whatever story text arrived
-        }
-        let narration = raw, actions = [];
-        try {
-          const p = parseJson(raw);
-          if (p && typeof p.narration === "string" && p.narration.trim()) {
-            narration = p.narration.trim();
-            actions = sanitizeActions(p.actions);
-          }
-        } catch (e) {
-          // Broken JSON: pull out just the story text so players never see raw code.
-          const m = raw.match(/"narration"\s*:\s*"((?:[^"\\]|\\.)*)/);
-          if (m) { try { narration = JSON.parse('"' + m[1] + '"'); } catch (x) { narration = m[1].replace(/\\n/g, "\n").replace(/\\"/g, '"'); } }
-        }
-        addMsg(r, "dm", "DM", narration);
-        actions.forEach((a) => r.pending.push({ id: r.aseq++, ...a }));
-        r.pending = r.pending.slice(-30);
-      } finally {
-        r.busy = false;
-        notify(r);
+      return json(res, 200, { ok: true, card: r.chars[who] || null });
+    }
+
+    // ----- combat actions any player may take for their own character -----
+    if (url === "/api/combat/init" || url === "/api/combat/hp") {
+      const c = r.combat;
+      if (!c) return json(res, 400, { error: "There is no combat right now." });
+      const who = str(body.who, 40).toLowerCase();
+      const mine = c.list.find((x) => x.side === "pc" && ((x.owner && x.owner.toLowerCase() === who) || (!x.owner && x.name.toLowerCase() === who)));
+      if (!mine) return json(res, 400, { error: "You have no character in this combat. Fill in My character, or ask the GM." });
+      if (url === "/api/combat/init") {
+        if (mine.init !== null && c.phase === "fight") return json(res, 400, { error: "Initiative is already set." });
+        const roll = die(20);
+        mine.init = roll + (mine.initBonus || 0);
+        addMsg(r, "roll", mine.name, `rolls initiative: [${roll}]${mine.initBonus ? (mine.initBonus > 0 ? " + " : " - ") + Math.abs(mine.initBonus) : ""} = **${mine.init}**`);
+        if (c.phase === "fight") sortCombat(r);
+      } else {
+        mine.hp = clampInt(body.hp, 0, 999, mine.hp);
+        if (body.maxHp !== undefined) mine.maxHp = clampInt(body.maxHp, 0, 999, mine.maxHp);
+        if (mine.owner && r.chars && r.chars[mine.owner]) { r.chars[mine.owner].hp = mine.hp; r.chars[mine.owner].maxHp = mine.maxHp; }
       }
+      combatBump(r);
+      notify(r);
       return json(res, 200, { ok: true });
     }
 
@@ -682,7 +1069,7 @@ async function handleApi(req, res, url, query) {
         const text = str(m && m.text, 1500);
         if (!text) continue;
         if (m.role === "dm") addMsg(r, "dm", "DM", text);
-        else addMsg(r, "player", str(m.who, 40) || "Player", text);
+        else addMsg(r, ["roll", "sys"].includes(m.role) ? m.role : "player", str(m.who, 40) || "Player", text);
       }
       return json(res, 200, { ok: true });
     }
@@ -709,6 +1096,7 @@ async function handleApi(req, res, url, query) {
       const names = (v) => (Array.isArray(v) ? v : []).slice(0, 40).map((x) => str(x, 60)).filter(Boolean);
       r.adv = { layout: str(body.layout, 4000), areas: names(body.areas), revealed: names(body.revealed), creatures: names(body.creatures) };
       r.adv.creatures.slice(0, 12).forEach((n) => lookupCreature(n).catch(() => {}));
+      if (body.full && typeof body.full === "object" && JSON.stringify(body.full).length < 150000) r.advFull = body.full;
       return json(res, 200, { ok: true });
     }
 
@@ -734,6 +1122,94 @@ async function handleApi(req, res, url, query) {
       return json(res, 200, { ok: true });
     }
 
+    if (url === "/api/gm/adv") {
+      return json(res, 200, { adv: r.advFull || null });
+    }
+
+    // ----- combat (GM) -----
+    if (url === "/api/gm/combat/start") {
+      await startCombat(r, body.tokens);
+      notify(r);
+      return json(res, 200, { ok: true, count: r.combat.list.length });
+    }
+    if (url === "/api/gm/combat/set") {
+      const c = r.combat;
+      const x = c && c.list.find((y) => y.id === str(body.id, 120));
+      if (!x) return json(res, 400, { error: "That creature isn't in the combat." });
+      if (body.hp !== undefined) x.hp = clampInt(body.hp, 0, 999, x.hp);
+      if (body.maxHp !== undefined) x.maxHp = clampInt(body.maxHp, 0, 999, x.maxHp);
+      if (body.init !== undefined) { x.init = body.init === "" || body.init === null ? null : clampInt(body.init, -10, 60, 0); if (c.phase === "fight") sortCombat(r); }
+      if (x.owner && r.chars && r.chars[x.owner]) { r.chars[x.owner].hp = x.hp; r.chars[x.owner].maxHp = x.maxHp; }
+      if (body.remove) { c.list = c.list.filter((y) => y !== x); if (c.turn >= c.list.length) c.turn = 0; }
+      combatBump(r);
+      notify(r);
+      return json(res, 200, { ok: true });
+    }
+    if (url === "/api/gm/combat/hp") {
+      const x = findCombatant(r, str(body.name, 60));
+      if (!x) return json(res, 400, { error: `"${str(body.name, 60)}" isn't in the combat tracker (or the name matches several).` });
+      const delta = clampInt(body.delta, -999, 999, 0);
+      const top = x.maxHp > 0 ? x.maxHp : 999;
+      x.hp = Math.max(0, Math.min(top, (x.hp || 0) + delta));
+      if (x.owner && r.chars && r.chars[x.owner]) r.chars[x.owner].hp = x.hp;
+      if (x.side !== "pc" && x.maxHp > 0 && x.hp <= 0) addMsg(r, "sys", "Table", `${x.name} is down.`);
+      combatBump(r);
+      notify(r);
+      return json(res, 200, { ok: true, hp: x.hp });
+    }
+    if (url === "/api/gm/combat/end") {
+      if (r.combat) {
+        for (const x of r.combat.list) if (x.owner && r.chars && r.chars[x.owner]) r.chars[x.owner].hp = x.hp;
+        r.combat = null;
+        addMsg(r, "sys", "Table", "Combat is over.");
+      }
+      notify(r);
+      return json(res, 200, { ok: true });
+    }
+    if (url === "/api/gm/combat/begin" || url === "/api/gm/combat/next") {
+      const c = r.combat;
+      if (!c) return json(res, 400, { error: "Start combat first." });
+      if (r.busy) return json(res, 409, { error: "The DM is still thinking. Wait a moment." });
+      const opts = { map: str(body.map, 5000), creatures: Array.isArray(body.creatures) ? body.creatures : [] };
+      if (url.endsWith("/begin")) {
+        if (c.phase === "fight") return json(res, 400, { error: "Combat has already begun. Use Next turn." });
+        const auto = [];
+        for (const x of c.list) if (x.init === null) { const roll = die(20); x.init = roll + (x.initBonus || 0); auto.push(`${x.name} ${x.init}`); }
+        if (auto.length) addMsg(r, "sys", "Table", "Initiative rolled automatically for: " + auto.join(", ") + ".");
+        c.phase = "fight"; c.round = 1; c.turn = 0;
+        sortCombat(r); c.turn = 0;
+        if (!alive(c.list[0])) stepTurn(r);
+        addMsg(r, "sys", "Table", "Round 1. Turn order: " + c.list.map((x) => `${x.name} (${x.init})`).join(", ") + ".");
+      } else {
+        if (c.phase !== "fight") return json(res, 400, { error: "Press Begin round 1 first." });
+        if (!stepTurn(r)) return json(res, 400, { error: "Nobody in the combat can act." });
+      }
+      combatBump(r);
+      if (c.list[c.turn].side === "pc") addMsg(r, "sys", "Table", `Round ${c.round}: it's ${c.list[c.turn].name}'s turn.`);
+      else await runMonsterTurns(r, opts);
+      notify(r);
+      return json(res, 200, { ok: true });
+    }
+
+    // ----- campaign (GM) -----
+    if (url === "/api/gm/campaign") {
+      return json(res, 200, { campaign: r.campaign || {}, chars: r.chars || {}, db: DB_ON, dbErr: r.dbErr || "" });
+    }
+    if (url === "/api/gm/campaign/save") {
+      r.campaign = r.campaign || { recaps: [], session: 1 };
+      if (body.world !== undefined) r.campaign.world = str(body.world, 3000);
+      if (body.sessions !== undefined) r.campaign.sessions = clampInt(body.sessions, 1, 30, 6);
+      if (body.bible !== undefined) r.campaign.bible = str(body.bible, 20000);
+      if (body.session !== undefined) r.campaign.session = clampInt(body.session, 1, 99, 1);
+      return json(res, 200, { ok: true, campaign: r.campaign });
+    }
+    if (url === "/api/gm/campaign/intro") {
+      const text = str((r.campaign || {}).intro, 3000);
+      if (!text) return json(res, 400, { error: "Build the campaign first." });
+      addMsg(r, "dm", "DM", text);
+      return json(res, 200, { ok: true });
+    }
+
     if (!API_KEY) return json(res, 500, { error: "Server has no GEMINI_API_KEY set." });
 
     if (url === "/api/gm/oneshot") {
@@ -754,8 +1230,67 @@ async function handleApi(req, res, url, query) {
       return json(res, 200, { text });
     }
 
+    if (url === "/api/gm/campaign/build") {
+      const camp = (r.campaign = r.campaign || { recaps: [], session: 1 });
+      if (body.world !== undefined) camp.world = str(body.world, 3000);
+      if (body.sessions !== undefined) camp.sessions = clampInt(body.sessions, 1, 30, 6);
+      if (!camp.world) return json(res, 400, { error: "Describe your world idea first." });
+      const party = partyText(r);
+      const out = await geminiJson({
+        model: PLAN_MODEL, maxTokens: 8192, system: CAMPAIGN_SYSTEM,
+        contents: one(`Sessions planned: ${camp.sessions || 6}.\nGM's world idea, tone, lines and veils:\n${camp.world}\n\n` +
+          (party ? `PLAYER CHARACTERS:\n${party}` : "No character cards yet: write general hooks the GM can adapt.")),
+      });
+      camp.bible = str(out.bible, 20000);
+      camp.intro = str(out.intro, 3000);
+      if (!camp.bible) throw new Error("The AI didn't write the campaign notes. Please try again.");
+      return json(res, 200, { campaign: camp });
+    }
+    if (url === "/api/gm/campaign/end") {
+      const camp = (r.campaign = r.campaign || { recaps: [], session: 1 });
+      if (!r.msgs.length) return json(res, 400, { error: "The story is empty, so there is nothing to recap." });
+      const n = camp.session || 1;
+      const story = r.msgs.slice(-150).map((m) => (m.role === "dm" ? "DM: " : m.who + ": ") + String(m.text).slice(0, 400)).join("\n");
+      const out = await geminiJson({
+        model: PLAN_MODEL, maxTokens: 4096, system: RECAP_SYSTEM,
+        contents: one(`This was session ${n}.\n\nSTORY LOG:\n${story}\n\n` + (camp.bible ? `CAMPAIGN NOTES:\n${trimMiddle(camp.bible, 3000, 1500)}\n\n` : "") +
+          (r.brief ? `SESSION BRIEF:\n${r.brief.slice(0, 3000)}\n\n` : "") + (partyText(r) ? `PARTY:\n${partyText(r)}` : "")),
+      });
+      const recap = str(out.recap, 2500), notes = str(out.notes, 3000);
+      if (!recap) throw new Error("The AI didn't write a recap. Please try again.");
+      camp.recaps = [...(camp.recaps || []), { n, text: recap }].slice(-20);
+      camp.bible = ((camp.bible || "") + `\n\nAFTER SESSION ${n}:\n${notes}`).trim().slice(-20000);
+      camp.session = n + 1;
+      addMsg(r, "dm", "DM", `**Session ${n} recap**\n${recap}`);
+      return json(res, 200, { recap, notes, campaign: camp });
+    }
+    if (url === "/api/gm/campaign/prep") {
+      const camp = r.campaign || {};
+      const chars = Object.values(r.chars || {});
+      const level = chars.length ? Math.round(chars.reduce((a, c) => a + (c.level || 1), 0) / chars.length) : clampInt(body.level, 1, 20, 3);
+      const n = camp.session || 1;
+      const text = await gemini({
+        model: PLAN_MODEL, maxTokens: 6144,
+        system: "You are an expert Dungeons & Dragons (2024, 5.5e) adventure designer. Write clear, usable GM notes in plain text with simple headings. No markdown symbols other than line breaks and dashes.",
+        contents: one(
+          `Design session ${n} of an ongoing campaign for ${chars.length || clampInt(body.players, 1, 12, 5)} players at level ${level}. ` +
+          `Continue naturally from the notes and recaps, follow the campaign arc, and give at least one player character a personal moment from their hooks.\n` +
+          (str(body.note, 400) ? `GM wishes for this session: ${str(body.note, 400)}\n` : "") +
+          `It must be finishable in about 3 hours. Use these headings:\n` +
+          `PREMISE AND HOOK\nSECRETS AND TWISTS (GM only)\nSCENES (3 or 4; for each: goal, challenge, NPCs, what the map needs)\n` +
+          `MONSTERS (prefer official D&D 2024 monster names, e.g. "Goblin Warrior" rather than "Goblin"; name, CR, AC, HP, attacks with bonuses and damage, special traits)\nTREASURE\nENDINGS\n` +
+          `Keep it under 900 words. Be concrete: names, numbers, DCs.\n\n` +
+          (camp.bible ? `CAMPAIGN NOTES:\n${trimMiddle(camp.bible, 4000, 2500)}\n\n` : "") +
+          ((camp.recaps || []).length ? `RECAPS:\n${camp.recaps.slice(-3).map((x) => `Session ${x.n}: ${x.text}`).join("\n")}\n\n` : "") +
+          (partyText(r) ? `PARTY:\n${partyText(r)}` : "")
+        ),
+      });
+      r.brief = str(text, 12000);
+      return json(res, 200, { text: r.brief });
+    }
+
     if (url === "/api/gm/build") {
-      if (!r.brief) return json(res, 400, { error: "Save a brief first (section 1). The map is built from it." });
+      if (!r.brief) return json(res, 400, { error: "Save a session brief first. The map is built from it." });
       const cols = clampInt(body.cols, 20, 60, 60);
       const rows = clampInt(body.rows, 15, 45, 40);
       const notes = str(body.notes, 500);
@@ -806,7 +1341,7 @@ async function handleApi(req, res, url, query) {
 
     json(res, 404, { error: "Not found" });
   } catch (e) {
-    json(res, 500, { error: e.message });
+    if (!res.headersSent) json(res, e.status || 500, { error: e.message });
   }
 }
 
@@ -832,7 +1367,7 @@ http.createServer((req, res) => {
     });
   }
   json(res, 404, { error: "Not found" });
-}).listen(PORT, () => console.log("AI DM running on port " + PORT));
+}).listen(PORT, () => console.log("AI DM running on port " + PORT + (DB_ON ? " (saving to the database)" : " (no database: memory only)")));
 ```
 
 ### index.html
@@ -871,6 +1406,7 @@ http.createServer((req, res) => {
   #gmstatus { margin: 6px 0 8px; padding: 6px 8px; background: #2a3045; border-radius: 6px; font-size: 13px; line-height: 1.35; min-height: 18px; }
   #gmstatus.bad { background: #5a2a2f; color: #ffd4d4; }
   #gm h4 { margin: 14px 0 6px; color: #f1e3b0; }
+  #gm details > .line:first-of-type { margin-top: 0; }
   #gm .hint { font-size: 12px; color: #aab; margin: 2px 0 6px; }
   #gm .line { display: flex; gap: 6px; margin: 4px 0; flex-wrap: wrap; align-items: center; }
   #brief { width: 100%; height: 150px; box-sizing: border-box; resize: vertical; }
@@ -886,6 +1422,31 @@ http.createServer((req, res) => {
   #rooms button { height: 26px; font-size: 12px; }
   #stats { white-space: pre-wrap; font: 12px/1.4 system-ui, sans-serif; color: #d9dbe8; background: #2a3045; border-radius: 6px; padding: 0 8px; margin: 6px 0; max-height: 320px; overflow-y: auto; }
   #stats:not(:empty) { padding: 8px; }
+  .roll { color: #b8f2c7; } .table { color: #aab0c8; font-style: italic; font-size: 13px; }
+  #combat { margin: 0 10px 6px; padding: 6px 8px; background: #262b3d; border: 1px solid #c0392b; border-radius: 8px; font-size: 13px; }
+  #combat .chead { display: flex; gap: 6px; align-items: center; margin-bottom: 4px; }
+  #combat .chead b { flex: 1; color: #ffb3a8; }
+  #combat button { height: 26px; font-size: 12px; padding: 0 8px; }
+  #clist { max-height: 150px; overflow-y: auto; }
+  .crow { display: flex; gap: 6px; align-items: center; padding: 2px 4px; border-radius: 4px; }
+  .crow.now { background: #4a3a1e; }
+  .crow.down { opacity: .5; text-decoration: line-through; }
+  .crow .cn { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .crow .ci { width: 26px; text-align: right; color: #f1e3b0; }
+  .crow input { width: 44px; padding: 2px 4px; }
+  .pc { color: #9db4ff; } .enemy { color: #ff9d9d; } .npc { color: #e6c86e; } .ally { color: #8fd0ff; }
+  #dice { flex: 1; min-width: 90px; }
+  .row.small button { height: 28px; font-size: 12px; padding: 0 8px; }
+  #charScreen { flex: 1; overflow-y: auto; padding: 10px; }
+  #charScreen label { display: block; font-size: 12px; color: #aab; margin: 8px 0 2px; }
+  #charScreen input, #charScreen textarea { width: 100%; box-sizing: border-box; }
+  #charScreen textarea { height: 110px; resize: vertical; }
+  #charScreen .two { display: flex; gap: 8px; } #charScreen .two > div { flex: 1; }
+  #gm details { border-top: 1px solid #3a4057; padding: 4px 0; }
+  #gm summary { cursor: pointer; padding: 8px 0 4px; color: #f1e3b0; font-weight: 600; }
+  #world, #bible { width: 100%; box-sizing: border-box; resize: vertical; }
+  #world { height: 80px; } #bible { height: 160px; }
+  #party, #intro { font-size: 12px; color: #c7c9d9; white-space: pre-wrap; margin: 4px 0; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -895,9 +1456,24 @@ http.createServer((req, res) => {
   <div id="log"><div class="msg dm">Welcome, adventurers. Each player: type what your character does and press Say. When everyone has spoken, one person presses Ask DM.</div></div>
   <div id="status"></div>
   <div id="actions" hidden></div>
+  <div id="combat" hidden>
+    <div class="chead"><b id="ctitle">Combat</b>
+      <button id="cInit" hidden>Roll initiative</button>
+      <button id="cBegin" hidden>Begin round 1</button>
+      <button id="cNext" hidden>Next turn</button></div>
+    <div id="clist"></div>
+  </div>
+  <div class="row small">
+    <input id="dice" type="text" placeholder="Roll: 1d20+5 attack">
+    <button id="rollBtn">Roll</button>
+    <button class="alt" data-roll="1d20">d20</button>
+    <button class="alt" data-roll="adv" title="Advantage: roll 2d20, keep the higher">Adv</button>
+    <button class="alt" data-roll="dis" title="Disadvantage: roll 2d20, keep the lower">Dis</button>
+  </div>
   <div class="row small">
     <label><input type="checkbox" id="useMap" checked> send map</label>
     <label><input type="checkbox" id="followCam" checked> follow DM camera</label>
+    <button id="charToggle" class="alt">My character</button>
     <button id="gmToggle" class="alt" hidden>GM tools</button>
   </div>
   <div class="row">
@@ -905,6 +1481,23 @@ http.createServer((req, res) => {
     <button id="sayBtn">Say</button>
     <button id="askBtn">Ask DM</button>
   </div>
+</div>
+
+<div id="charScreen" hidden>
+  <div class="line"><button id="charBack" class="alt">Back to story</button></div>
+  <h4 style="color:#f1e3b0;margin:10px 0 4px">My character</h4>
+  <div style="font-size:12px;color:#aab">Your GM and the AI DM use this card. Max HP and AC also go into the combat tracker.</div>
+  <label for="cName">Character name</label><input id="cName" type="text" maxlength="40">
+  <div class="two"><div><label for="cSpecies">Species</label><input id="cSpecies" type="text" maxlength="30" placeholder="e.g. Elf"></div>
+    <div><label for="cCls">Class</label><input id="cCls" type="text" maxlength="40" placeholder="e.g. Wizard"></div></div>
+  <div class="two"><div><label for="cLevel">Level</label><input id="cLevel" type="number" min="1" max="20" value="1"></div>
+    <div><label for="cMaxHp">Max HP</label><input id="cMaxHp" type="number" min="0" max="999"></div>
+    <div><label for="cAc">AC</label><input id="cAc" type="number" min="0" max="40"></div>
+    <div><label for="cInitB">Initiative bonus</label><input id="cInitB" type="number" min="-5" max="20" value="0"></div></div>
+  <label for="cStory">Backstory and goals (a few lines)</label>
+  <textarea id="cStory" maxlength="1200" placeholder="Where you come from, what you want, who you're looking for..."></textarea>
+  <div class="line" style="margin-top:8px"><button id="charSave">Save character</button></div>
+  <div id="charStatus" style="font-size:12px;color:#aab;margin-top:6px"></div>
 </div>
 
 <div id="gm" hidden>
@@ -916,7 +1509,23 @@ http.createServer((req, res) => {
  </div>
  <div id="gmbody">
 
-  <h4>1. Secret adventure brief</h4>
+  <details id="campSec">
+  <summary>Campaign (session zero)</summary>
+  <div class="hint">1. Each player opens <b>My character</b> on the story screen and fills in their card. 2. Describe your world here and press Build campaign. 3. Play sessions. 4. At the end of each session press End session: the AI writes a recap and drafts the next session's brief.</div>
+  <div class="line"><button id="partyBtn" class="alt">Refresh party</button></div>
+  <div id="party">No character cards yet.</div>
+  <div class="line">Sessions planned <input type="number" id="cSessions" value="6" min="1" max="30"></div>
+  <textarea id="world" placeholder="Your world idea: setting, tone, themes, and lines and veils (things to avoid or keep off-screen)."></textarea>
+  <div class="line"><button id="campBuild">Build campaign</button><button id="campSave" class="alt">Save notes</button></div>
+  <textarea id="bible" placeholder="Secret campaign notes appear here. Edit freely, then press Save notes."></textarea>
+  <div id="intro"></div>
+  <div class="line"><button id="introBtn" class="alt" hidden>Post intro to story</button><button id="recapBtn" class="alt" hidden>Post last recap to story</button></div>
+  <div class="line">Next: session <span id="sessNo">1</span> <input type="text" id="prepNote" placeholder="Wishes for the next session (optional)"></div>
+  <div class="line"><button id="endSess">End session: recap + prep next</button><button id="prepOnly" class="alt">Prep next session only</button></div>
+  </details>
+
+  <details id="briefSec" open>
+  <summary>Session brief (secret)</summary>
   <div class="hint">Only you see this. The AI uses it as secret notes and never shows it to players directly.</div>
   <div class="line">
     Level <input type="number" id="lvl" value="3" min="1" max="20">
@@ -926,7 +1535,10 @@ http.createServer((req, res) => {
   <div class="line"><button id="draft">Draft one-shot</button><button id="saveBrief" class="alt">Save brief</button></div>
   <textarea id="brief" placeholder="Paste or write your secret notes here, or draft a one-shot above. Edit freely, then press Save brief."></textarea>
 
-  <h4>2. Build the adventure map and monsters</h4>
+  </details>
+
+  <details open>
+  <summary>Build the map and monsters</summary>
   <div class="hint">Reads your saved brief, draws the whole adventure as one connected map, then places every monster and NPC from the brief in its room. Save the brief first. Pressing again replaces the previous generated map and creatures.</div>
   <div class="line"><input type="text" id="notes" placeholder="Optional extra instructions (e.g. make it a ruined swamp temple)"></div>
   <div class="line">Cols <input type="number" id="cols" value="60" min="20" max="60"> Rows <input type="number" id="rows" value="40" min="15" max="45"><button id="build">Build map + monsters</button></div>
@@ -935,27 +1547,46 @@ http.createServer((req, res) => {
   <div id="legend"></div>
   <div id="rooms"></div>
 
-  <h4>3. Add one more creature (optional)</h4>
+  </details>
+
+  <details id="combatSec">
+  <summary>Combat</summary>
+  <div class="hint">Start combat puts everyone into the turn order: player characters from their cards (or their tokens) and every monster, NPC and ally on the map, with official HP and AC. Players press Roll initiative on the story screen (anyone who hasn't is rolled for automatically when you press Begin). Next turn moves on; when it reaches the monsters, the AI runs all of them in one go (one AI request) and proposes moves and damage for you to approve.</div>
+  <div class="line"><button id="cStart">Start combat</button><button id="cBegin2" class="alt">Begin round 1</button><button id="cNext2" class="alt">Next turn</button><button id="cEnd" class="alt">End combat</button></div>
+  </details>
+
+  <details>
+  <summary>Add one more creature</summary>
   <div class="hint">For anything the brief missed. Tokens made here can also be moved by the AI's suggestions. Col and Row are grid cells.</div>
   <div class="line"><input type="text" id="tname" placeholder="Name (e.g. Goblin)"> Count <input type="number" id="tcount" value="1" min="1" max="12"></div>
   <div class="line">Col <input type="number" id="tcol" value="5" min="0"> Row <input type="number" id="trow" value="5" min="0">
     <select id="tside"><option value="enemy">Enemy</option><option value="npc">NPC</option><option value="ally">Ally</option></select>
     <button id="spawn">Spawn</button></div>
 
-  <h4>4. Enemy moves</h4>
+  </details>
+
+  <details>
+  <summary>Enemy moves</summary>
   <div class="hint">The AI suggests where enemies and NPCs should go. Nothing moves until you press Apply.</div>
   <div class="line"><input type="text" id="situation" placeholder="Optional note (e.g. goblins are scared of fire)"></div>
   <div class="line"><button id="suggest">Suggest moves</button><button id="applyAll" class="alt" hidden>Apply all</button></div>
   <div id="moves"></div>
 
-  <h4>5. Monster stat blocks (only you see these)</h4>
+  </details>
+
+  <details>
+  <summary>Monster stat blocks (only you see these)</summary>
   <div class="hint">The DM automatically gets the official stats for monsters on the map and in your built adventure. This shows what it gets. 2024 rules first, 2014 if a monster isn't in the 2024 rules yet.</div>
   <div class="line"><button id="statsBtn" class="alt">Show stat blocks</button></div>
   <pre id="stats"></pre>
   <div class="hint">Stat data from the D&amp;D System Reference Documents 5.1 and 5.2 by Wizards of the Coast LLC (CC BY 4.0, dndbeyond.com/srd), via the free Open5e API.</div>
 
-  <h4>Housekeeping</h4>
+  </details>
+
+  <details>
+  <summary>Housekeeping</summary>
   <div class="line"><button id="clearBtn" class="alt">Clear story</button></div>
+  </details>
 </div>
 </div>
 
@@ -1015,7 +1646,7 @@ function md(t) {
 function add(cls, text) {
   const d = document.createElement("div");
   d.className = "msg " + cls;
-  if (cls === "dm") d.innerHTML = md(text); else d.textContent = text;
+  if (cls === "dm" || cls === "roll") d.innerHTML = md(text); else d.textContent = text;
   log.appendChild(d);
   log.scrollTop = log.scrollHeight;
 }
@@ -1071,7 +1702,7 @@ async function tryRestore() {
     if (list.length) {
       await api("/api/restore", {
         room: roomId, epoch: e,
-        msgs: list.map((m) => ({ role: m.r === "d" ? "dm" : "player", who: m.w, text: m.t })),
+        msgs: list.map((m) => ({ role: { d: "dm", r: "roll", s: "sys" }[m.r] || "player", who: m.w, text: m.t })),
       });
       setTimeout(fetchLog, 300);
     }
@@ -1093,13 +1724,17 @@ async function fetchLog() {
     } else {
       for (const m of d.msgs) {
         last = m.id;
-        add(m.role === "dm" ? "dm" : "you", m.role === "dm" ? m.text : `${m.who}: ${m.text}`);
-        msgCache.push({ r: m.role === "dm" ? "d" : "p", w: m.who, t: m.text });
+        if (m.role === "dm") add("dm", m.text);
+        else if (m.role === "roll") add("roll", `\u{1F3B2} ${m.who} ${m.text}`);
+        else if (m.role === "sys") add("table", m.text);
+        else add("you", `${m.who}: ${m.text}`);
+        msgCache.push({ r: { dm: "d", roll: "r", sys: "s" }[m.role] || "p", w: m.who, t: m.text });
       }
       if (d.msgs.length) scheduleSave();
     }
     serverBusy = d.busy;
     lastErr = "";
+    renderCombat(d.combat || null);
     if (d.latest === 0) tryRestore();
     if (isGmRole && Array.isArray(d.actions)) handleActions(d.actions);
   } catch (e) {
@@ -1245,8 +1880,8 @@ function busyBtn(btn, label, fn) {
   });
 }
 
-$("gmToggle").addEventListener("click", () => { $("story").hidden = true; $("gm").hidden = false; });
-$("gmBack").addEventListener("click", () => { $("gm").hidden = true; $("story").hidden = false; });
+$("gmToggle").addEventListener("click", () => showScreen("gm"));
+$("gmBack").addEventListener("click", () => showScreen("story"));
 
 busyBtn($("gmUnlock"), "Checking...", async () => {
   store("gmcode", $("gmcode").value);
@@ -1260,9 +1895,17 @@ busyBtn($("gmUnlock"), "Checking...", async () => {
     $("brief").value = d.brief || "";
     gmStatus("Unlocked.");
   }
+  try {
+    const srv = (await api("/api/gm/adv", { room: roomId }, true)).adv;
+    if (srv && srv.spec) { advSet(srv); store("map-" + roomId, JSON.stringify(srv.spec)); } // the server's copy wins (it may come from another device)
+  } catch (e) {}
   const m = savedMap();
   if (m) $("legend").textContent = layoutText(m);
   if (advGet()) { renderRooms(); try { await syncAdv(); } catch (e) {} }
+  try { await loadCampaign(); } catch (e) {}
+  const el = $("gmstatus");
+  el.textContent += d.db ? (d.dbErr ? " Warning: the last save to the database failed (" + d.dbErr + ")." : " Your game is saved to the database.")
+    : " No database is set up, so the game lives in memory until the server restarts.";
 });
 
 busyBtn($("draft"), "Drafting...", async () => {
@@ -1382,7 +2025,7 @@ async function syncAdv() {
   const adv = advGet();
   if (!adv) return;
   const creatures = [...new Set((adv.tokens || []).map((t) => String(t.name).replace(/\s+\d+$/, "")))];
-  await api("/api/gm/state", { room: roomId, layout: layoutText(adv.spec), areas: adv.spec.areas.map((a) => a.name), revealed: adv.revealed, creatures }, true);
+  await api("/api/gm/state", { room: roomId, layout: layoutText(adv.spec), areas: adv.spec.areas.map((a) => a.name), revealed: adv.revealed, creatures, full: adv }, true);
 }
 
 // Covers every cell that is NOT a revealed area with solid "rock", so the painted art only shows inside revealed rooms.
@@ -1706,6 +2349,224 @@ $("clearBtn").addEventListener("click", async () => {
   catch (e) { gmStatus("Problem: " + e.message); }
 });
 
+
+// For risky buttons: the first press only warns; a second press within 4 seconds goes ahead.
+function twice(btn, warning) {
+  if (btn.dataset.armed) { delete btn.dataset.armed; return true; }
+  btn.dataset.armed = "1";
+  gmStatus(warning);
+  setTimeout(() => { delete btn.dataset.armed; }, 4000);
+  return false;
+}
+
+/* ---------- screens ---------- */
+function showScreen(id) {
+  for (const s of ["story", "gm", "charScreen"]) $(s).hidden = s !== id;
+}
+
+/* ---------- dice ---------- */
+async function roll(text) {
+  text = String(text || "").trim();
+  if (!text) return;
+  try { await api("/api/roll", { room: roomId, who: myName, text }); $("dice").value = ""; }
+  catch (e) { add("sys", "Roll: " + e.message); }
+}
+$("rollBtn").addEventListener("click", () => roll($("dice").value));
+$("dice").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); roll($("dice").value); } });
+document.querySelectorAll("[data-roll]").forEach((b) => b.addEventListener("click", () => {
+  const extra = $("dice").value.trim();
+  roll(b.dataset.roll + (extra && !/^[0-9d+\-]/i.test(extra) ? " " + extra : ""));
+}));
+
+/* ---------- my character ---------- */
+const CARD = { name: "cName", species: "cSpecies", cls: "cCls", level: "cLevel", maxHp: "cMaxHp", ac: "cAc", init: "cInitB", story: "cStory" };
+$("charToggle").addEventListener("click", async () => {
+  showScreen("charScreen");
+  $("charStatus").textContent = "Loading...";
+  try {
+    const d = await api(`/api/char?room=${encodeURIComponent(roomId)}&who=${encodeURIComponent(myName)}`);
+    const c = d.card || {};
+    for (const k in CARD) $(CARD[k]).value = c[k] ?? (k === "level" ? 1 : k === "init" ? 0 : "");
+    $("charStatus").textContent = d.card ? "This is your saved card." : "No card yet: fill it in and press Save character.";
+  } catch (e) { $("charStatus").textContent = "Problem: " + e.message; }
+});
+$("charBack").addEventListener("click", () => showScreen("story"));
+$("charSave").addEventListener("click", async () => {
+  const card = {};
+  for (const k in CARD) card[k] = $(CARD[k]).value;
+  if (!card.name.trim()) { $("charStatus").textContent = "Give your character a name first."; return; }
+  try {
+    await api("/api/char", { room: roomId, who: myName, card });
+    $("charStatus").textContent = "Saved. Your GM and the DM can see your character now.";
+  } catch (e) { $("charStatus").textContent = "Problem: " + e.message; }
+});
+
+/* ---------- combat tracker ---------- */
+let combat = null, combatKey = "";
+function renderCombat(c) {
+  const key = JSON.stringify(c);
+  if (key === combatKey) return;
+  combatKey = key;
+  combat = c;
+  const box = $("combat"), list = $("clist");
+  box.hidden = !c;
+  if (!c) return;
+  const fight = c.phase === "fight";
+  $("ctitle").textContent = fight ? `Combat · Round ${c.round}` : "Combat · roll initiative";
+  const me = c.list.find((x) => x.side === "pc" && ((x.owner && x.owner === myName) || (!x.owner && x.name === myName)));
+  $("cInit").hidden = !me || me.init !== null;
+  $("cBegin").hidden = !isGmRole || fight;
+  $("cNext").hidden = !isGmRole || !fight;
+  list.innerHTML = "";
+  c.list.forEach((x, i) => {
+    const row = document.createElement("div");
+    const down = x.side !== "pc" && (x.status === "Down" || (x.maxHp > 0 && x.hp <= 0));
+    row.className = "crow" + (fight && i === c.turn ? " now" : "") + (down ? " down" : "");
+    const ini = document.createElement("span");
+    ini.className = "ci";
+    ini.textContent = x.init === null || x.init === undefined ? "?" : x.init;
+    const nm = document.createElement("span");
+    nm.className = "cn " + x.side;
+    nm.textContent = (fight && i === c.turn ? "▶ " : "") + x.name;
+    row.append(ini, nm);
+    const mine = x === me;
+    if (x.hp !== undefined && (isGmRole || mine)) {
+      // GM can edit everyone; a player edits their own HP
+      const hp = document.createElement("input");
+      hp.type = "number"; hp.min = 0; hp.value = x.hp; hp.title = "Current HP";
+      hp.addEventListener("change", async () => {
+        try {
+          if (isGmRole) await api("/api/gm/combat/set", { room: roomId, id: x.id, hp: +hp.value }, true);
+          else await api("/api/combat/hp", { room: roomId, who: myName, hp: +hp.value });
+        } catch (e) { add("sys", "HP: " + e.message); }
+      });
+      const of = document.createElement("span");
+      of.textContent = x.maxHp ? `/${x.maxHp}` + (x.ac ? ` AC ${x.ac}` : "") : (x.ac ? `AC ${x.ac}` : "");
+      row.append(hp, of);
+      if (isGmRole && !fight) {
+        const ii = document.createElement("input");
+        ii.type = "number"; ii.value = x.init ?? ""; ii.title = "Initiative (type a player's physical roll here)"; ii.placeholder = "init";
+        ii.addEventListener("change", () => api("/api/gm/combat/set", { room: roomId, id: x.id, init: ii.value }, true).catch((e) => add("sys", e.message)));
+        row.append(ii);
+      }
+    } else if (x.hp !== undefined) {
+      const t = document.createElement("span");
+      t.textContent = x.maxHp ? `${x.hp}/${x.maxHp}` : "";
+      row.append(t);
+    } else {
+      const t = document.createElement("span");
+      t.textContent = x.status || "";
+      row.append(t);
+    }
+    list.appendChild(row);
+  });
+  const now = list.querySelector(".now");
+  if (now) now.scrollIntoView({ block: "nearest" });
+}
+$("cInit").addEventListener("click", async () => {
+  try { await api("/api/combat/init", { room: roomId, who: myName }); } catch (e) { add("sys", e.message); }
+});
+async function combatTurn(path, btns) {
+  btns.forEach((b) => { b.disabled = true; });
+  try {
+    const map = useMap.checked ? await mapContext() : "";
+    let creatures = [];
+    try { creatures = (await readTokens()).filter((t) => t.side !== "pc").map((t) => t.name); } catch (e) {}
+    status.textContent = "Next turn... (if it's the monsters' turn, the DM is thinking)";
+    await api(path, { room: roomId, map, creatures }, true);
+    status.textContent = "";
+  } catch (e) { status.textContent = ""; add("sys", "Combat: " + e.message); gmStatus("Problem: " + e.message); }
+  btns.forEach((b) => { b.disabled = false; });
+}
+const beginBtns = [$("cBegin"), $("cBegin2")], nextBtns = [$("cNext"), $("cNext2")];
+beginBtns.forEach((b) => b.addEventListener("click", () => combatTurn("/api/gm/combat/begin", beginBtns)));
+nextBtns.forEach((b) => b.addEventListener("click", () => combatTurn("/api/gm/combat/next", nextBtns)));
+busyBtn($("cStart"), "Starting...", async () => {
+  if (combat && !twice($("cStart"), "A combat is already running. Press Start combat again within 4 seconds to replace it.")) return;
+  const tokens = await readTokens();
+  await api("/api/gm/combat/start", { room: roomId, tokens: tokens.map((t) => ({ id: t.id, name: t.name, side: t.side })) }, true);
+  gmStatus("Combat started. Players roll initiative on the story screen; press Begin round 1 when ready.");
+});
+let endArmed = false;
+$("cEnd").addEventListener("click", async () => {
+  if (!endArmed) { endArmed = true; $("cEnd").textContent = "Really end?"; setTimeout(() => { endArmed = false; $("cEnd").textContent = "End combat"; }, 4000); return; }
+  endArmed = false; $("cEnd").textContent = "End combat";
+  try { await api("/api/gm/combat/end", { room: roomId }, true); gmStatus("Combat ended. Players' HP is kept on their cards."); }
+  catch (e) { gmStatus("Problem: " + e.message); }
+});
+
+/* ---------- campaign (GM) ---------- */
+let camp = {};
+function renderCampaign(d) {
+  camp = d.campaign || {};
+  const chars = d.chars || {};
+  const names = Object.keys(chars);
+  $("party").textContent = names.length
+    ? names.map((p) => { const c = chars[p]; return `${c.name || "?"}: ${[c.species, c.cls].filter(Boolean).join(" ")} ${c.level}, HP ${c.hp}/${c.maxHp}, AC ${c.ac} (${p})`; }).join("\n")
+    : "No character cards yet. Players fill them in with My character.";
+  if (camp.world !== undefined && !$("world").value) $("world").value = camp.world;
+  if (camp.sessions) $("cSessions").value = camp.sessions;
+  if (camp.bible !== undefined) $("bible").value = camp.bible;
+  $("intro").textContent = camp.intro ? "Opening narration (players haven't seen it yet unless you posted it):\n" + camp.intro : "";
+  $("introBtn").hidden = !camp.intro;
+  $("recapBtn").hidden = !(camp.recaps && camp.recaps.length);
+  $("sessNo").textContent = camp.session || 1;
+}
+async function loadCampaign() {
+  const d = await api("/api/gm/campaign", { room: roomId }, true);
+  renderCampaign(d);
+  return d;
+}
+busyBtn($("partyBtn"), "Loading...", async () => { await loadCampaign(); gmStatus("Party refreshed."); });
+busyBtn($("campSave"), "Saving...", async () => {
+  const d = await api("/api/gm/campaign/save", { room: roomId, world: $("world").value, bible: $("bible").value, sessions: +$("cSessions").value }, true);
+  camp = d.campaign;
+  gmStatus("Campaign notes saved. The DM uses them from the next Ask DM.");
+});
+busyBtn($("campBuild"), "Building...", async () => {
+  if (!$("world").value.trim()) throw new Error("Describe your world idea first.");
+  if ($("bible").value.trim() && !twice($("campBuild"), "You already have campaign notes. Press Build campaign again within 4 seconds to replace them.")) return;
+  gmStatus("The AI is writing the campaign (world, factions, villain, session arc, a hook for each character). This can take a minute...");
+  const d = await api("/api/gm/campaign/build", { room: roomId, world: $("world").value, sessions: +$("cSessions").value }, true);
+  renderCampaign({ campaign: d.campaign, chars: (await api("/api/gm/campaign", { room: roomId }, true)).chars });
+  gmStatus("Campaign ready. Read and edit the notes (then Save notes). When the players are ready, post the intro, then press Prep next session only to draft session 1's brief.");
+});
+busyBtn($("introBtn"), "Posting...", async () => { await api("/api/gm/campaign/intro", { room: roomId }, true); gmStatus("Intro posted to the story."); });
+busyBtn($("recapBtn"), "Posting...", async () => {
+  const r = (camp.recaps || [])[camp.recaps.length - 1];
+  if (!r) throw new Error("No recap yet.");
+  await api("/api/say", { room: roomId, who: "Previously", text: `Session ${r.n} recap: ${r.text}` });
+  gmStatus("Last recap posted to the story.");
+});
+async function prepNext() {
+  gmStatus(`Drafting the brief for session ${camp.session || 1} (this can take a minute)...`);
+  const d = await api("/api/gm/campaign/prep", { room: roomId, note: $("prepNote").value, players: +$("plr").value }, true);
+  $("brief").value = d.text;
+  store("brief-" + roomId, d.text);
+  $("briefSec").open = true;
+  gmStatus(`Session ${camp.session || 1} brief is ready and saved in Session brief. Edit it if you like, then Build map + monsters when you're ready to play.`);
+}
+busyBtn($("prepOnly"), "Drafting...", prepNext);
+let sessArmed = false;
+$("endSess").addEventListener("click", async () => {
+  const b = $("endSess");
+  if (!sessArmed) {
+    sessArmed = true; b.textContent = "Really end the session?";
+    gmStatus("Press again within 4 seconds. The AI writes a recap (posted to the story), updates your campaign notes and drafts the next session's brief (2 AI requests).");
+    setTimeout(() => { sessArmed = false; b.textContent = "End session: recap + prep next"; }, 4000);
+    return;
+  }
+  sessArmed = false; b.disabled = true; b.textContent = "Working...";
+  try {
+    gmStatus("Step 1 of 2: writing the recap and updating your notes...");
+    const d = await api("/api/gm/campaign/end", { room: roomId }, true);
+    renderCampaign({ campaign: d.campaign, chars: (await api("/api/gm/campaign", { room: roomId }, true)).chars });
+    gmStatus("Step 2 of 2: drafting the next session...");
+    await prepNext();
+  } catch (e) { gmStatus("Problem: " + e.message); }
+  b.disabled = false; b.textContent = "End session: recap + prep next";
+});
+
 /* ---------- AI actions (GM approves, camera auto-runs) ---------- */
 const handled = new Set();
 let pendingActions = [], shownKey = "", lastTokens = [];
@@ -1721,6 +2582,8 @@ function describe(a) {
   if (a.type === "fog") return a.on ? "Cover the scene in fog" : "Clear the fog";
   if (a.type === "light") return `Give ${a.name} a light (${a.radius} cells)`;
   if (a.type === "reveal") return `Reveal "${a.area}" on the map`;
+  if (a.type === "damage") return `${a.name} takes ${a.amount} damage`;
+  if (a.type === "heal") return `${a.name} regains ${a.amount} HP`;
   return a.type;
 }
 
@@ -1780,6 +2643,8 @@ async function broadcast(channel, data, fallback) {
 }
 
 async function runAction(a) {
+  if (a.type === "damage" || a.type === "heal") // only the tracker changes; nothing on the map
+    return api("/api/gm/combat/hp", { room: roomId, name: a.name, delta: a.type === "damage" ? -a.amount : a.amount }, true);
   if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room.");
   await ready;
   const tokens = await readTokens();
@@ -2002,10 +2867,21 @@ User test of v0.6.0: (1) first "Build map + monsters" failed with "The AI's answ
 - Tested locally: map retry after a cut-off answer, narration rescue, and unit tests of matchToken/freeCell/spawn numbering/floor all pass.
 **Next:** user uploads v0.6.1 and re-tests build, AI spawn/move/remove actions, and Suggest moves near player tokens. Then remaining options: refreshed setup guide, dice + combat tracker, session-zero campaign builder, persistent storage in a free database.
 
-## 20. v0.6.2 (latest): Clear story fix (untested live)
+## 20. v0.6.2: Clear story fix (untested live)
 User report: "the story did not clear when clicking the clear story button".
 **Cause (race made worse by v0.6.0 live updates):** Clear empties the server log and writes an empty backup to room metadata. The server's notify now reaches every panel instantly, faster than Owlbear syncs the GM's metadata write to other clients. A player panel sees an empty log (latest 0), calls tryRestore, reads its still-old local copy of the room metadata, and restores the old story to the server.
 **Fix: story IDs ("epoch").** Server room has `epoch` (string). `/api/clear` sets it to the ID the GM sends (random); `/api/log` returns it. `/api/restore` is refused (`stale: true`) if the server has an epoch and the backup's epoch differs; a fresh server (epoch "") accepts any backup and adopts its epoch. Room metadata `com.aidm/story` is now `{ e: epoch, m: [messages] }` (old plain-array format still read, as epoch ""). Clients reset their display when the epoch changes (as well as when latest < last) and then refetch. Clear button: writes `{e: fresh, m: []}` first, cancels any pending backup save, then calls /api/clear with the same ID; GM status explains the two-press confirm ("Really clear?" within 4 s) and confirms "Story cleared for everyone."
 Tested locally: old-format restore on a fresh server, clear, stale restore refused, play continues, restore with the new ID after a restart.
 **Next:** user re-tests Clear story with a player window open; continue the v0.6.1 tests (build, AI spawn/move/remove, Suggest moves near players).
+
+## 21. v0.7.0 (latest): dice, combat tracker, session zero / campaign, Upstash database (untested live)
+User chose (via questions): build all four remaining items (dice + combat tracker, session zero / campaign builder, free database, refreshed setup guide). Dice rolled in our panel. Monster turns: ONE AI request per run of consecutive monster turns. HP: monsters automatic from stat blocks (DM proposes damage, GM approves), players set their own. Session zero: GM + players together; players fill a short character card (name, species, class, level, max HP, AC, initiative bonus, backstory/goals). Between sessions: AI recap + next-session prep. Database: Upstash (free: 500,000 commands/month, 256 MB; Supabase rejected because free projects pause after 7 days idle).
+**Database (server):** env `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` (REST API via fetch, no npm). Each room saved as JSON at key `aidm:room:<roomId>` (SET ... EX 180 days) 1.5 s after every POST (`res.on("finish", touch)`). Saved fields: msgs, next, brief, epoch, adv, advFull, combat, campaign, chars, aseq (art images are NOT saved; Add art regenerates). `loadRoom()` loads from the database on first use; if the database can't be read the request fails with a clear error instead of starting an empty room that would overwrite the save. Without the env vars everything stays in memory as before. The full adventure state (map spec, creatures, revealed rooms, art URL) is now sent to the server (`/api/gm/state` field `full`) and pulled on Unlock (`POST /api/gm/adv`; server copy wins), so room reveal works from any GM device. Unlock status says whether the game is saved to the database. Room-metadata story backup still exists as a fallback.
+**Dice:** `POST /api/roll {who, text}`: server rolls with crypto.randomInt. Accepts "1d20+5 label", "2d6+3", "d20", "adv"/"dis" (2d20 keep high/low), kh1/kl1, up to 10 terms, 50 dice, 1000 sides. Posted as message role "roll" (shown green with a die emoji; natural 20/1 noted). UI: roll box + Roll, d20, Adv, Dis buttons (text after a quick button's expression is used as the label). The DM sees rolls in the story. For monsters/NPCs the server adds a fresh PRE-ROLLED DICE list (12 d20, 8 d4, 12 d6, 10 d8, 8 d10, 6 d12) to every DM request; the system prompt tells it to use them in order and show the math, never to roll for players.
+**Combat tracker:** `r.combat = {phase: setup|fight, round, turn, v, list:[{id, name, side, owner, init, initBonus, hp, maxHp, ac}]}`. Start combat (GM tools > Combat) sends all tokens on the map: player characters come from character cards (owner = Owlbear player name), player tokens without a card get a row with no HP; enemies/NPCs/allies get official HP/AC/initiative bonus from the SRD lookup and auto-rolled initiative (announced). Players press Roll initiative on the story screen (`/api/combat/init`); GM can type initiatives during setup. Begin round 1 auto-rolls anyone missing, sorts (init, then bonus, players first on ties). Next turn skips downed monsters; when the current creature is not a player, `runMonsterTurns()` runs every consecutive non-player creature in ONE DM request (instruction includes order, use pre-rolled dice, compare vs AC, propose move + damage actions, don't act for players) and then announces the next player's turn. "Table" messages (role "sys", grey italic) narrate turn changes. Players see monsters' health as Healthy/Bloodied/Down; the GM sees and can edit numbers (`/api/gm/combat/set`). Players edit their own HP (`/api/combat/hp`), which also updates their card. New AI action types `damage`/`heal` {name, amount} (up to 12 per reply, separate from the 6-action cap) -> GM approval card -> `/api/gm/combat/hp` (exact name or unique base name). A monster reaching 0 HP is announced as down. End combat (press twice) writes players' HP back to their cards. Combat state is also given to the DM in every request (turn order with HP/AC, current turn). Ask DM and combat turns share one function `runDm()`.
+**Characters & campaign:** story screen button "My character" opens a card form (`GET/POST /api/char`, keyed by Owlbear player name). GM tools > Campaign (session zero): party list (Refresh party), sessions planned, world idea (tone, lines and veils) -> Build campaign (`/api/gm/campaign/build`, PLAN_MODEL, JSON {bible, intro}; press twice to replace existing notes) -> secret campaign notes (editable, Save notes) + opening narration (Post intro to story). "End session: recap + prep next" (press twice): `/api/gm/campaign/end` (JSON {recap, notes}: player-safe recap posted to the story, notes appended to the campaign notes as "AFTER SESSION n", session number +1) then `/api/gm/campaign/prep` (writes the next session's brief in the one-shot format with campaign context; saved as the server brief and put in the brief box). "Prep next session only" does just the second step (use it for session 1). "Post last recap to story" for the start of the next session. Every DM request now includes THE PARTY (cards incl. backstory), SECRET CAMPAIGN NOTES (first 3000 + last 1500 chars) and the last 2 recaps.
+**UI:** GM tools sections are now fold-open panels (Campaign, Session brief, Build the map and monsters, Combat, Add one more creature, Enemy moves, Monster stat blocks, Housekeeping); headings no longer numbered. Panel height 700. Browser pop-up confirms are avoided (may be blocked in Owlbear's frame); risky buttons use press-twice.
+**Testing:** server tested locally with mocked Upstash/Gemini/Open5e (cards, dice, combat start/begin/next with a monster block, damage, player HP, restart restoring everything from the database, database-down refusal, campaign build/intro/end/prep). Panel tested in headless Chromium against the local server with a stub Owlbear SDK (outside Owlbear the panel acts as GM): rolls, character card, unlock, campaign build/intro, combat start/initiative/begin/monster turn/approve damage/next, end session; no JS errors. NOT tested: inside a real Owlbear room, player-role rendering of the tracker, real Upstash, real Gemini output quality for monster turns.
+**Next:** user sets up Upstash (guide), uploads v0.7.0, tests: character cards, dice, a full combat, session zero campaign build, end session, server restart keeps the game.
+**Setup guide refreshed (v0.7.0):** Claude Doc "AI Dungeon Master: Setup and Play Guide" at https://claude.ai/code/artifact/8ee7ee67-5b42-442f-b418-dcc75136f8a4 . Parts: overview; core setup (Gemini key, files, GitHub, Render, env var table); free extras (Upstash steps: console.upstash.com > Redis > + Create Database > Free plan > Connect > REST tab gives UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN; Pollinations key); adding/updating the extension; session zero; running a session (approval table); combat (with a turn-loop diagram); ending a session; AI request costs and a troubleshooting table; sources. Update it when features change.
 
