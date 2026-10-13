@@ -15,7 +15,7 @@
 - **Node server** (`server.js`, zero npm dependencies, Node 18+) hosted on Render free tier. Serves the 3 static files and a JSON API. Calls the Gemini REST API (`generateContent`).
 - **Shared story:** one in-memory log per Owlbear room (resets when Render restarts or sleeps). Players press **Say** (adds a message, no AI call). One person presses **Ask DM** (one Gemini request for the whole round). Client polls `/api/log` every 3 seconds.
 - **Two passwords (Render env vars):** `ACCESS_CODE` (all players, entered in the panel's "Access code" box on the story screen) and `GM_CODE` (GM only, entered in the GM tools screen). They must be different. Server enforces both. Common confusion: the error "Wrong or missing access code" means the ACCESS code box, not the GM code.
-- **Render env vars:** `GEMINI_API_KEY` (required), `ACCESS_CODE`, `GM_CODE`, `MODEL` (live story model; user currently has `gemini-3.8-flash`), optional `PLAN_MODEL` (model for one-shots, maps, moves; defaults to MODEL).
+- **Render env vars:** `GEMINI_API_KEY` (required), `ACCESS_CODE`, `GM_CODE`, optional `POLLINATIONS_KEY` (free image key), `MODEL` (live story model; user currently has `gemini-3.8-flash`), optional `PLAN_MODEL` (model for one-shots, maps, moves; defaults to MODEL).
 - Repo files (all in repo root, flat, exact names): `index.html`, `manifest.json`, `icon.svg`, `server.js`, `package.json`. Render settings: Node, build `npm install`, start `npm start`, Free instance.
 
 ## 3. Features built
@@ -96,7 +96,7 @@ No LICENSE file is in the ZIP, so do NOT copy their code or art assets. Use it o
 **Implications for our steps:** Step 2 (history): store a TRIMMED copy in room metadata (their unbounded array is a known risk); never store the brief there. Step 3 (actions): use their action list as the checklist, run with GM approval, bundled in the Ask DM request. Step 4 (fog): only whole-scene fog on/off and token lights are proven; fine-grained reveals need FOG-layer items, unverified. Step 7 (map art): `insertMap` approach is proven; we still need a free image source and hosting.
 
 ## 7. Full source code (current)
-Create each file with exactly these contents (current version: v0.5.2). `icon.svg` and `package.json` are unchanged since the first version.
+Create each file with exactly these contents (current version: v0.6.0). `icon.svg` and `package.json` are unchanged since the first version.
 
 ### package.json
 
@@ -116,7 +116,7 @@ Create each file with exactly these contents (current version: v0.5.2). `icon.sv
 ```json
 {
   "name": "AI Dungeon Master",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "manifest_version": 1,
   "description": "An AI DM that narrates, drafts one-shots, draws maps and suggests enemy moves.",
   "author": "You",
@@ -164,6 +164,7 @@ const SYSTEM_PROMPT = `You are the Dungeon Master for a group of several players
 - Play NPCs and monsters in character. Stay consistent with what has already happened in this chat.
 - You cannot roll dice. When a roll is needed, tell the players exactly what to roll (e.g. "Roll a DC 13 Dexterity save") and wait for the results.
 - If you are not sure about a rule, say so and give your best ruling instead of inventing an exact rule.
+- If MONSTER STAT BLOCKS are provided, use those exact numbers for attacks, damage, saves and abilities. Never tell players a monster's exact HP, AC or stat numbers; describe how hurt it looks instead.
 - Each player message begins with that player's name. Several players may act in one round: respond to all of them, addressing players by name.
 - If a map snapshot is provided, use it for positions. Distances are in grid cells (1 cell = 5 ft).
 - When new enemies or NPCs appear, say clearly who and how many so the GM can place their tokens.
@@ -252,6 +253,24 @@ function getRoom(id) {
 function addMsg(r, role, who, text) {
   r.msgs.push({ id: r.next++, role, who, text });
   if (r.msgs.length > 200) r.msgs.splice(0, r.msgs.length - 200);
+  notify(r);
+}
+
+// Live updates: each open panel keeps one stream open; we send a tiny "something changed" ping and the panel fetches the log.
+const streams = {};
+function notify(r) {
+  const set = streams[r.id];
+  if (!set) return;
+  for (const res of set) { try { res.write("data: u\n\n"); } catch (e) {} }
+}
+function openStream(req, res, r) {
+  const set = (streams[r.id] = streams[r.id] || new Set());
+  if (set.size >= 60) return json(res, 429, { error: "Too many open panels." });
+  res.writeHead(200, { ...headers("text/event-stream"), "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+  res.write(": hello\n\n");
+  set.add(res);
+  const beat = setInterval(() => { try { res.write(": ping\n\n"); } catch (e) {} }, 20000);
+  req.on("close", () => { clearInterval(beat); set.delete(res); if (!set.size) delete streams[r.id]; });
 }
 
 function headers(type) {
@@ -349,6 +368,112 @@ function recentStory(r, n) {
   return r.msgs.slice(-n).map((m) => (m.role === "dm" ? "DM: " : m.who + ": ") + m.text).join("\n");
 }
 
+
+// ---------- Official stat blocks (SRD via the free Open5e API) ----------
+// 2024 rules first (SRD 5.2), then 2014 (SRD 5.1). Results are cached for the life of the server.
+const SRD_URL = "https://api.open5e.com/v2/creatures/";
+const statCache = new Map();
+async function srdQuery(params) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const resp = await fetch(SRD_URL + "?" + new URLSearchParams({ ...params, limit: "20" }), { headers: { Accept: "application/json" }, signal: ctrl.signal });
+    if (!resp.ok) throw new Error("SRD " + resp.status);
+    const d = await resp.json();
+    return Array.isArray(d.results) ? d.results : [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+const baseName = (n) => String(n || "").replace(/\s+#?\d+$/, "").replace(/\s+/g, " ").trim();
+async function lookupCreature(name) {
+  const want = baseName(name);
+  const key = want.toLowerCase();
+  if (!key) return null;
+  if (statCache.has(key)) return statCache.get(key);
+  const words = key.split(" ");
+  const tries = [];
+  for (const n of [key, ...(words.length > 1 ? [words[words.length - 1], words[0]] : [])]) {
+    tries.push(["srd-2024", { name__iexact: n }], ["srd-2014", { name__iexact: n }]);
+    // 2024 renamed some monsters (e.g. "Goblin" became "Goblin Warrior")
+    if (n === key) tries.push(["srd-2024", { name__icontains: n }, true]);
+  }
+  let found = null, failed = false;
+  for (const [doc, q, loose] of tries) {
+    try {
+      let res = await srdQuery({ ...q, document__key__in: doc });
+      if (loose) res = res.filter((c) => String(c.name).toLowerCase().startsWith(key)).sort((a, b) => a.name.length - b.name.length);
+      if (res.length) { found = res[0]; break; }
+    } catch (e) { failed = true; break; }
+  }
+  const out = found ? { asked: want, data: found } : null;
+  if (found || !failed) statCache.set(key, out);
+  if (statCache.size > 300) statCache.delete(statCache.keys().next().value);
+  return out;
+}
+function crText(cr) {
+  const n = Number(cr);
+  if (n === 0.125) return "1/8";
+  if (n === 0.25) return "1/4";
+  if (n === 0.5) return "1/2";
+  return isFinite(n) ? String(n) : "?";
+}
+function formatStat(hit) {
+  const c = hit.data || {};
+  const sign = (v) => (v >= 0 ? "+" : "") + v;
+  const ed = c.document && c.document.key === "srd-2024" ? "2024" : "2014";
+  const lines = [];
+  let head = `${c.name} [${ed} rules]`;
+  if (String(c.name).toLowerCase() !== hit.asked.toLowerCase()) head += ` (closest official match for "${hit.asked}")`;
+  lines.push(head + ` - ${(c.size && c.size.name) || ""} ${(c.type && c.type.name) || ""}, CR ${crText(c.challenge_rating)}`.replace(/\s+,/, ","));
+  lines.push(`AC ${c.armor_class}${c.armor_detail ? " (" + c.armor_detail + ")" : ""}, HP ${c.hit_points}${c.hit_dice ? " (" + c.hit_dice + ")" : ""}, Initiative ${sign(c.initiative_bonus || 0)}`);
+  const sp = c.speed_all || c.speed || {};
+  const speeds = ["walk", "fly", "swim", "climb", "burrow"].filter((k) => Number(sp[k]) > 0).map((k) => `${k} ${sp[k]} ft`);
+  if (speeds.length) lines.push("Speed " + speeds.join(", "));
+  const ab = c.ability_scores || {}, mods = c.modifiers || {};
+  const short = { strength: "STR", dexterity: "DEX", constitution: "CON", intelligence: "INT", wisdom: "WIS", charisma: "CHA" };
+  const abl = Object.keys(short).filter((k) => ab[k] !== undefined).map((k) => `${short[k]} ${ab[k]} (${sign(mods[k] !== undefined ? mods[k] : Math.floor((ab[k] - 10) / 2))})`);
+  if (abl.length) lines.push(abl.join(" "));
+  const skills = Object.entries(c.skill_bonuses || {}).map(([k, v]) => `${k} ${sign(v)}`);
+  if (skills.length) lines.push("Skills " + skills.join(", "));
+  const ri = c.resistances_and_immunities || {};
+  for (const [k, label] of [["damage_resistances_display", "Resistances"], ["damage_immunities_display", "Immunities"], ["damage_vulnerabilities_display", "Vulnerabilities"], ["condition_immunities_display", "Condition immunities"]])
+    if (typeof ri[k] === "string" && ri[k].trim()) lines.push(`${label} ${ri[k].trim()}`);
+  const senses = [];
+  if (c.darkvision_range) senses.push(`darkvision ${c.darkvision_range} ft`);
+  if (c.blindsight_range) senses.push(`blindsight ${c.blindsight_range} ft`);
+  if (c.tremorsense_range) senses.push(`tremorsense ${c.tremorsense_range} ft`);
+  if (c.truesight_range) senses.push(`truesight ${c.truesight_range} ft`);
+  if (c.passive_perception) senses.push(`passive Perception ${c.passive_perception}`);
+  if (senses.length) lines.push("Senses " + senses.join(", "));
+  const clip = (t) => String(t || "").replace(/\s+/g, " ").trim().slice(0, 320);
+  for (const t of (Array.isArray(c.traits) ? c.traits : []).slice(0, 6)) lines.push(`Trait - ${t.name}: ${clip(t.desc)}`);
+  const kinds = { ACTION: "Action", BONUS_ACTION: "Bonus action", REACTION: "Reaction", LEGENDARY_ACTION: "Legendary action" };
+  const acts = (Array.isArray(c.actions) ? c.actions : []).slice().sort((a, b) => (a.order_in_statblock || 0) - (b.order_in_statblock || 0)).slice(0, 10);
+  for (const a of acts) lines.push(`${kinds[a.action_type] || "Action"} - ${a.name}: ${clip(a.desc)}`);
+  return lines.join("\n").slice(0, 2200);
+}
+function creatureNames(r, fromClient) {
+  const list = [...(Array.isArray(fromClient) ? fromClient : []), ...((r.adv && r.adv.creatures) || [])];
+  const seen = new Set(), out = [];
+  for (const n of list) {
+    const b = baseName(str(n, 60));
+    if (b && !seen.has(b.toLowerCase())) { seen.add(b.toLowerCase()); out.push(b); }
+  }
+  return out.slice(0, 10);
+}
+async function statsBlock(names, cap, plain) {
+  if (!names.length) return "";
+  const hits = await Promise.all(names.map((n) => lookupCreature(n).catch(() => null)));
+  const blocks = hits.filter(Boolean).map(formatStat);
+  const missing = names.filter((n, i) => !hits[i]);
+  if (!blocks.length && !plain) return "";
+  let text = blocks.join("\n\n");
+  if (missing.length) text += (text ? "\n\n" : "") + "No official stat block found for: " + missing.join(", ") + (plain ? " (the DM improvises these)." : ". Improvise sensible stats for these.");
+  text = text.slice(0, cap || 7000);
+  return plain ? text : "\n\nMONSTER STAT BLOCKS (official D&D SRD; use these exact numbers):\n" + text;
+}
+
 // ---------- Map + moves helpers ----------
 function sanitizeMap(s) {
   s = s || {};
@@ -384,13 +509,13 @@ Rules:
 - Lay out EVERY scene or location in the adventure notes, in story order, from one end of the map to the other. Name each main area after its scene or location (for example "Scene 1: Flooded Entry"). Link areas with corridors (kind "corridor", 2 cells wide) so everything is reachable.
 - Use 6 to 16 areas. Rooms should be at least 5x5 cells, and big encounter rooms 8x8 or larger. Leave empty space between rooms.
 - Put "features" inside areas: cover, hazards, doors at area edges, and interesting objects that fit the story. Use 10 to 40 features. Keep each 1 to 3 cells.
-- "creatures": include EVERY monster and NPC from the notes, in the area where the party meets them. Use the exact area name. Use the counts in the notes (maximum 12 per entry). Give the creature name without numbers. Leave out the player characters.`;
+- "creatures": include EVERY monster and NPC from the notes, in the area where the party meets them. Use the exact area name. Use the counts in the notes (maximum 12 per entry). Give the creature name without numbers. Use the official D&D 2024 (SRD 5.2) monster name when one fits (for example "Goblin Warrior", "Bandit", "Skeleton", "Cultist"), so the creature's official stats can be looked up. Leave out the player characters.`;
 
 const MOVES_SYSTEM = `You control the enemies and NPCs in a tabletop D&D (2024, 5.5e) combat. Output ONLY valid JSON, no commentary.
 Schema: {"summary": string (one sentence on the enemy plan), "moves": [{"id": string, "col": int, "row": int, "reason": string (max 12 words)}]}
 Rules:
 - Only move tokens whose side is "enemy", "npc" or "ally". Tokens with side "pc" are the players: never move them.
-- Grid cells: 1 cell = 5 ft. Unless told otherwise, a token can move at most 6 cells per turn (diagonals count as 1 cell).
+- Grid cells: 1 cell = 5 ft. If a creature's stat block gives a walking speed, it can move at most that many feet / 5 cells per turn; otherwise at most 6 cells (diagonals count as 1 cell).
 - Only end on walkable floor (inside a listed area, or anywhere if no map is given). Do not end on a cell with a token or on a blocking feature (pillar, statue, table, water, tree, altar, chest).
 - Play tactically but fairly: use cover, focus weak targets, protect leaders, and avoid unrealistic coordination. Cowardly or injured creatures may retreat.
 - You may omit tokens that should stay put.`;
@@ -462,6 +587,7 @@ async function handleApi(req, res, url, query) {
       const since = parseInt(query.get("since") || "0", 10) || 0;
       return json(res, 200, { msgs: r.msgs.filter((m) => m.id > since), latest: r.next - 1, busy: r.busy, ...(isGm(req) ? { actions: r.pending } : {}) });
     }
+    if (req.method === "GET" && url === "/api/stream") return openStream(req, res, getRoom(query.get("room")));
     if (req.method === "GET" && url === "/api/gm/brief") {
       if (!needGm(req, res)) return;
       return json(res, 200, { brief: getRoom(query.get("room")).brief });
@@ -489,9 +615,11 @@ async function handleApi(req, res, url, query) {
         return json(res, 400, { error: "Nothing new for the DM to respond to. Have players say what they do first." });
       const map = str(body.map, 5000);
       r.busy = true;
+      notify(r);
       try {
+        const stats = await statsBlock(creatureNames(r, body.creatures));
         const raw = await gemini({
-          system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + advBlock(r) + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
+          system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + advBlock(r) + stats + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
           contents: buildContents(r.msgs),
           json: true,
           maxTokens: 4096,
@@ -509,6 +637,7 @@ async function handleApi(req, res, url, query) {
         r.pending = r.pending.slice(-30);
       } finally {
         r.busy = false;
+        notify(r);
       }
       return json(res, 200, { ok: true });
     }
@@ -533,6 +662,7 @@ async function handleApi(req, res, url, query) {
       r.msgs = [];
       r.next = 1;
       r.pending = [];
+      notify(r);
       return json(res, 200, { ok: true });
     }
 
@@ -543,7 +673,8 @@ async function handleApi(req, res, url, query) {
 
     if (url === "/api/gm/state") {
       const names = (v) => (Array.isArray(v) ? v : []).slice(0, 40).map((x) => str(x, 60)).filter(Boolean);
-      r.adv = { layout: str(body.layout, 4000), areas: names(body.areas), revealed: names(body.revealed) };
+      r.adv = { layout: str(body.layout, 4000), areas: names(body.areas), revealed: names(body.revealed), creatures: names(body.creatures) };
+      r.adv.creatures.slice(0, 12).forEach((n) => lookupCreature(n).catch(() => {}));
       return json(res, 200, { ok: true });
     }
 
@@ -557,9 +688,15 @@ async function handleApi(req, res, url, query) {
       return json(res, 200, { url: `/art/${encodeURIComponent(r.id)}.jpg?v=${r.artV}`, mime: r.art.type.split(";")[0] });
     }
 
+    if (url === "/api/gm/stats") {
+      const text = await statsBlock(creatureNames(r, body.creatures), 12000, true);
+      return json(res, 200, { text: text || "No official stat blocks found for the creatures on the map or in your built adventure." });
+    }
+
     if (url === "/api/gm/actions/resolve") {
       const ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(Number));
       r.pending = r.pending.filter((a) => !ids.has(a.id));
+      notify(r);
       return json(res, 200, { ok: true });
     }
 
@@ -576,7 +713,7 @@ async function handleApi(req, res, url, query) {
           `Design a self-contained one-shot for ${players} players at level ${level}. Theme and tone: ${theme}.\n` +
           `It must be finishable in about 3 hours. Use these headings:\n` +
           `PREMISE AND HOOK\nSECRETS AND TWISTS (GM only)\nSCENES (3 or 4; for each: goal, challenge, NPCs, what the map needs)\n` +
-          `MONSTERS (name, CR, AC, HP, attacks with bonuses and damage, special traits)\nTREASURE\nENDINGS\n` +
+          `MONSTERS (prefer official D&D 2024 monster names, e.g. "Goblin Warrior" rather than "Goblin"; name, CR, AC, HP, attacks with bonuses and damage, special traits)\nTREASURE\nENDINGS\n` +
           `Keep it under 900 words. Be concrete: names, numbers, DCs.`
         ),
       });
@@ -616,6 +753,7 @@ async function handleApi(req, res, url, query) {
       const cols = clampInt(body.cols, 10, 200, 40);
       const rows = clampInt(body.rows, 8, 200, 30);
       const situation = str(body.situation, 500);
+      const stats = await statsBlock(creatureNames(r, movable.map((k) => k.name)), 5000);
       const t = await gemini({
         model: PLAN_MODEL,
         json: true,
@@ -624,7 +762,7 @@ async function handleApi(req, res, url, query) {
           (str(body.layout, 4000) ? `${str(body.layout, 4000)}\n\n` : "") +
           `Tokens (col,row are grid cells):\n` + tokens.map((k) => `- id=${k.id} name="${k.name}" side=${k.side} at (${k.col},${k.row})`).join("\n") +
           (situation ? `\n\nGM note: ${situation}` : "") +
-          `\n\nRecent story:\n${recentStory(r, 8)}` + briefBlock(r)
+          `\n\nRecent story:\n${recentStory(r, 8)}` + briefBlock(r) + stats
         ),
       });
       const parsed = parseJson(t);
@@ -715,6 +853,8 @@ http.createServer((req, res) => {
   #rooms .rrow { display: flex; gap: 6px; align-items: center; margin: 3px 0; font-size: 13px; }
   #rooms .rrow span { flex: 1; }
   #rooms button { height: 26px; font-size: 12px; }
+  #stats { white-space: pre-wrap; font: 12px/1.4 system-ui, sans-serif; color: #d9dbe8; background: #2a3045; border-radius: 6px; padding: 0 8px; margin: 6px 0; max-height: 320px; overflow-y: auto; }
+  #stats:not(:empty) { padding: 8px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -725,7 +865,6 @@ http.createServer((req, res) => {
   <div id="status"></div>
   <div id="actions" hidden></div>
   <div class="row small">
-    <label for="code">Access code</label><input id="code" type="password">
     <label><input type="checkbox" id="useMap" checked> send map</label>
     <label><input type="checkbox" id="followCam" checked> follow DM camera</label>
     <button id="gmToggle" class="alt" hidden>GM tools</button>
@@ -741,6 +880,7 @@ http.createServer((req, res) => {
  <div id="gmhead">
   <div class="line"><button id="gmBack" class="alt">Back to story</button></div>
   <div class="line"><label for="gmcode">GM code</label><input id="gmcode" type="password"><button id="gmUnlock">Unlock</button></div>
+  <div class="line"><label for="code">Player access code</label><input id="code" type="password" title="Shared automatically with every player in this room"></div>
   <div id="gmstatus">Enter your GM code and press Unlock.</div>
  </div>
  <div id="gmbody">
@@ -777,6 +917,12 @@ http.createServer((req, res) => {
   <div class="line"><button id="suggest">Suggest moves</button><button id="applyAll" class="alt" hidden>Apply all</button></div>
   <div id="moves"></div>
 
+  <h4>5. Monster stat blocks (only you see these)</h4>
+  <div class="hint">The DM automatically gets the official stats for monsters on the map and in your built adventure. This shows what it gets. 2024 rules first, 2014 if a monster isn't in the 2024 rules yet.</div>
+  <div class="line"><button id="statsBtn" class="alt">Show stat blocks</button></div>
+  <pre id="stats"></pre>
+  <div class="hint">Stat data from the D&amp;D System Reference Documents 5.1 and 5.2 by Wizards of the Coast LLC (CC BY 4.0, dndbeyond.com/srd), via the free Open5e API.</div>
+
   <h4>Housekeeping</h4>
   <div class="line"><button id="clearBtn" class="alt">Clear story</button></div>
 </div>
@@ -796,6 +942,7 @@ const FOR = "com.aidm/for";
 const STORY = "com.aidm/story";
 const CAM = "com.aidm/camera";
 const LIGHT = "com.aidm/light";
+const ACCESS = "com.aidm/access";
 const MASK = "com.aidm/mask";
 const OFF = 0.05; // token inset, as a fraction of a cell
 
@@ -811,7 +958,17 @@ function store(k, v) {
 }
 codeEl.value = store("dmcode") || "";
 $("gmcode").value = store("gmcode") || "";
-codeEl.addEventListener("change", () => store("dmcode", codeEl.value));
+codeEl.addEventListener("change", () => { store("dmcode", codeEl.value); shareCode(); openStream(); fetchLog(); });
+
+// The GM's panel puts the player access code into the room's shared data, so players never type it.
+async function shareCode() {
+  if (!isGmRole || !OBR.isAvailable || !codeEl.value) return;
+  try {
+    await ready;
+    const meta = await OBR.room.getMetadata();
+    if (meta[ACCESS] !== codeEl.value) await OBR.room.setMetadata({ [ACCESS]: codeEl.value });
+  } catch (e) { console.error("share code", e); }
+}
 
 // Minimal, safe markdown: HTML is escaped first, then bold, italic, code, headings and bullets are added.
 function md(t) {
@@ -887,8 +1044,9 @@ async function tryRestore() {
   } catch (e) {} finally { restoring = false; }
 }
 
+let again = false;
 async function fetchLog() {
-  if (inflight) return;
+  if (inflight) { again = true; return; }
   inflight = true;
   try {
     const d = await api(`/api/log?room=${encodeURIComponent(roomId)}&since=${last}`, null, isGmRole && !!$("gmcode").value);
@@ -906,11 +1064,58 @@ async function fetchLog() {
     if (d.latest === 0) tryRestore();
     if (isGmRole && Array.isArray(d.actions)) handleActions(d.actions);
   } catch (e) {
-    if (e.message !== lastErr) { add("sys", e.message); lastErr = e.message; }
+    let msg = e.message;
+    if (/access code/i.test(msg)) msg = isGmRole
+      ? "Enter the player access code in GM tools (it is shared with your players automatically)."
+      : "Waiting for the GM: the GM needs to open this panel so the access code is shared with you.";
+    if (msg !== lastErr) { add("sys", msg); lastErr = msg; }
   } finally {
     inflight = false;
     refreshUi();
+    if (again) { again = false; setTimeout(fetchLog, 50); }
   }
+}
+
+/* ---------- live updates (with polling as a backup) ---------- */
+let streamOk = false, streamCtrl = null, lastStreamData = 0, streamRetry = null;
+async function openStream() {
+  if (streamCtrl) streamCtrl.abort();
+  clearTimeout(streamRetry);
+  const ctrl = new AbortController();
+  streamCtrl = ctrl;
+  try {
+    const r = await fetch(`/api/stream?room=${encodeURIComponent(roomId)}`, {
+      headers: { "X-Access-Code": codeEl.value }, signal: ctrl.signal, cache: "no-store",
+    });
+    if (!r.ok || !r.body) throw new Error("no stream");
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    streamOk = true; lastStreamData = Date.now();
+    fetchLog();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      lastStreamData = Date.now();
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const ev = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        if (/^data:/m.test(ev)) fetchLog();
+      }
+    }
+  } catch (e) {}
+  if (streamCtrl === ctrl) {
+    streamOk = false; streamCtrl = null;
+    streamRetry = setTimeout(openStream, 5000);
+  }
+}
+let tick = 0;
+function poll() {
+  tick++;
+  // If the stream went quiet (no heartbeat for 45 s), treat it as broken and reconnect.
+  if (streamOk && Date.now() - lastStreamData > 45000) { streamOk = false; openStream(); }
+  if (!streamOk || tick % 5 === 0) fetchLog(); // every 3 s without a stream, every 15 s with one
 }
 
 /* ---------- map helpers ---------- */
@@ -976,7 +1181,9 @@ async function askDm() {
   askBusy = true; refreshUi();
   try {
     const map = useMap.checked ? await mapContext() : "";
-    await api("/api/dm", { room: roomId, map });
+    let creatures = [];
+    try { creatures = (await readTokens()).filter((t) => t.side !== "pc").map((t) => t.name); } catch (e) {}
+    await api("/api/dm", { room: roomId, map, creatures });
   } catch (e) { add("sys", "Problem: " + e.message); }
   askBusy = false;
   await fetchLog();
@@ -1135,7 +1342,8 @@ function featureOwner(spec, f) {
 async function syncAdv() {
   const adv = advGet();
   if (!adv) return;
-  await api("/api/gm/state", { room: roomId, layout: layoutText(adv.spec), areas: adv.spec.areas.map((a) => a.name), revealed: adv.revealed }, true);
+  const creatures = [...new Set((adv.tokens || []).map((t) => String(t.name).replace(/\s+\d+$/, "")))];
+  await api("/api/gm/state", { room: roomId, layout: layoutText(adv.spec), areas: adv.spec.areas.map((a) => a.name), revealed: adv.revealed, creatures }, true);
 }
 
 // Covers every cell that is NOT a revealed area with solid "rock", so the painted art only shows inside revealed rooms.
@@ -1327,6 +1535,15 @@ busyBtn($("addArt"), "Painting...", async () => {
   advSet(adv);
   await updateMask();
   gmStatus(adv.art ? "Art added. Revealed rooms keep their creatures." : "The picture could not be loaded. The flat map was kept.");
+});
+
+busyBtn($("statsBtn"), "Looking up...", async () => {
+  let creatures = [];
+  try { creatures = (await readTokens()).filter((t) => t.side !== "pc").map((t) => t.name); } catch (e) {}
+  try { await syncAdv(); } catch (e) {}
+  const d = await api("/api/gm/stats", { room: roomId, creatures }, true);
+  $("stats").textContent = d.text;
+  gmStatus("Stat blocks loaded. The DM uses these automatically.");
 });
 
 busyBtn($("spawn"), "Spawning...", async () => {
@@ -1600,8 +1817,23 @@ async function handleActions(list) {
     } catch (e) {}
   }
   if (isGm) $("gmToggle").hidden = false;
+  if (OBR.isAvailable) {
+    try {
+      if (isGm) await shareCode();
+      else {
+        const meta = await OBR.room.getMetadata();
+        if (meta[ACCESS]) codeEl.value = meta[ACCESS];
+      }
+      OBR.room.onMetadataChange((meta) => {
+        if (!isGmRole && meta[ACCESS] && meta[ACCESS] !== codeEl.value) {
+          codeEl.value = meta[ACCESS]; lastErr = ""; openStream(); fetchLog();
+        }
+      });
+    } catch (e) { console.error(e); }
+  }
   fetchLog();
-  setInterval(fetchLog, 3000);
+  openStream();
+  setInterval(poll, 3000);
 })();
 </script>
 </body>
@@ -1651,4 +1883,14 @@ Remaining after that: Item 4 polish (move Access code box into GM tools, SSE ins
 ## 17. v0.5.2 test result (2026-10-13)
 - User tested v0.5.2 with the fixed manifest: PASSED. Art shows only inside revealed rooms, and reveal works for players ("test passed with the fog reveal"). The fog question (why `setFilled` did not hide MAP items for players) is moot for now; the rock mask handles hiding.
 - Next: user picks the next feature. Options offered: (a) Item 4 polish: move the Access code box into the GM screen, Server-Sent Events instead of 3-second polling, refreshed setup guide covering everything built; (b) later-ideas list: SRD monster/rules lookup, dice + combat tracker, session-zero campaign builder, persistent storage in a free database.
+
+## 18. v0.6.0 (latest): shared access code, live updates, official stat blocks (untested live)
+User chose (via questions): GM shares the access code automatically; stat blocks are fed to the DM; stat blocks visible to the GM only; if a monster is not in the 2024 data, use the 2014 version.
+**Shared access code:** the "Access code" box moved from the story screen into the GM screen ("Player access code", under the GM code). The GM's panel writes it to room metadata key `com.aidm/access` (on startup and when changed); player panels read it at startup and via `OBR.room.onMetadataChange`, so players never type it. Players without it see "Waiting for the GM: the GM needs to open this panel...". Security note: anyone in the Owlbear room can read room metadata, so the code protects the server from strangers, not from people in the room. UNVERIFIED live: players can read room metadata (expected), `onMetadataChange` name.
+**Live updates:** server `GET /api/stream?room=` (needs X-Access-Code header) keeps a Server-Sent Events connection per panel (max 60 per room, heartbeat comment every 20 s) and sends `data: u` whenever the room changes (`notify(r)` in addMsg, DM busy on/off, clear, action resolve). The client reads it with fetch + ReadableStream (not EventSource, so the code stays in a header) and then calls /api/log. Fallback: polling every 3 s if no stream, every 15 s with a stream; reconnect after 5 s, or if no data for 45 s. fetchLog no longer drops an update that arrives mid-request. Tested locally: 4 events for say + Ask DM. UNVERIFIED: Render passes streams through without buffering (the 45 s watchdog falls back to polling if not).
+**Stat blocks:** server looks up creatures in the free Open5e API `https://api.open5e.com/v2/creatures/?name__iexact=<name>&document__key__in=srd-2024` (verified real response format: name, document.key, size.name, type.name, challenge_rating, armor_class, armor_detail, hit_points, hit_dice, initiative_bonus, speed/speed_all, ability_scores, modifiers, skill_bonuses, resistances_and_immunities.*_display, darkvision_range etc., passive_perception, traits[{name,desc}], actions[{name,desc,action_type ACTION|BONUS_ACTION|..., order_in_statblock}]). Order tried: full name 2024 exact, 2014 exact (`srd-2014`), 2024 name-starts-with (shortest), then last word, then first word ("Swamp Troll" -> Troll, marked "closest official match"). Trailing numbers stripped ("Goblin 2"). Cache per server (no cache on network errors). Note 2024 renamed some monsters ("Goblin" -> "Goblin Warrior"), so the one-shot and map prompts now ask for official 2024 names.
+- Names come from the client (non-PC tokens on the map, sent with Ask DM and Suggest moves) plus `r.adv.creatures` (base names of all creatures in the built adventure, sent by the GM in /api/gm/state; also warms the cache). Max 10 names, 7000 chars, injected as MONSTER STAT BLOCKS into the Ask DM system prompt and the enemy-moves prompt (moves now use each creature's walking speed). DM rule added: use exact numbers, never tell players exact HP/AC.
+- GM tools section 5 "Monster stat blocks (only you see these)" with "Show stat blocks" (`POST /api/gm/stats`, GM code) showing what the DM gets, plus the CC-BY 4.0 SRD attribution line.
+- Tested locally with a mocked Open5e and mocked Gemini: lookups, fallbacks, prompt injection, GM-only access all pass. The sandbox cannot reach Open5e, so the real API was only checked by reading its responses.
+**Next:** user uploads v0.6.0 and tests: (1) players no longer see an access code box and still play; (2) messages and DM replies appear instantly for everyone; (3) GM tools -> Show stat blocks lists real stats; (4) DM narration uses correct monster numbers. Then remaining options: refreshed setup guide, dice + combat tracker, session-zero campaign builder, persistent storage in a free database.
 

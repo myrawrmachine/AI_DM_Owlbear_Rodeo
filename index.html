@@ -44,6 +44,8 @@
   #rooms .rrow { display: flex; gap: 6px; align-items: center; margin: 3px 0; font-size: 13px; }
   #rooms .rrow span { flex: 1; }
   #rooms button { height: 26px; font-size: 12px; }
+  #stats { white-space: pre-wrap; font: 12px/1.4 system-ui, sans-serif; color: #d9dbe8; background: #2a3045; border-radius: 6px; padding: 0 8px; margin: 6px 0; max-height: 320px; overflow-y: auto; }
+  #stats:not(:empty) { padding: 8px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -54,7 +56,6 @@
   <div id="status"></div>
   <div id="actions" hidden></div>
   <div class="row small">
-    <label for="code">Access code</label><input id="code" type="password">
     <label><input type="checkbox" id="useMap" checked> send map</label>
     <label><input type="checkbox" id="followCam" checked> follow DM camera</label>
     <button id="gmToggle" class="alt" hidden>GM tools</button>
@@ -70,6 +71,7 @@
  <div id="gmhead">
   <div class="line"><button id="gmBack" class="alt">Back to story</button></div>
   <div class="line"><label for="gmcode">GM code</label><input id="gmcode" type="password"><button id="gmUnlock">Unlock</button></div>
+  <div class="line"><label for="code">Player access code</label><input id="code" type="password" title="Shared automatically with every player in this room"></div>
   <div id="gmstatus">Enter your GM code and press Unlock.</div>
  </div>
  <div id="gmbody">
@@ -106,6 +108,12 @@
   <div class="line"><button id="suggest">Suggest moves</button><button id="applyAll" class="alt" hidden>Apply all</button></div>
   <div id="moves"></div>
 
+  <h4>5. Monster stat blocks (only you see these)</h4>
+  <div class="hint">The DM automatically gets the official stats for monsters on the map and in your built adventure. This shows what it gets. 2024 rules first, 2014 if a monster isn't in the 2024 rules yet.</div>
+  <div class="line"><button id="statsBtn" class="alt">Show stat blocks</button></div>
+  <pre id="stats"></pre>
+  <div class="hint">Stat data from the D&amp;D System Reference Documents 5.1 and 5.2 by Wizards of the Coast LLC (CC BY 4.0, dndbeyond.com/srd), via the free Open5e API.</div>
+
   <h4>Housekeeping</h4>
   <div class="line"><button id="clearBtn" class="alt">Clear story</button></div>
 </div>
@@ -125,6 +133,7 @@ const FOR = "com.aidm/for";
 const STORY = "com.aidm/story";
 const CAM = "com.aidm/camera";
 const LIGHT = "com.aidm/light";
+const ACCESS = "com.aidm/access";
 const MASK = "com.aidm/mask";
 const OFF = 0.05; // token inset, as a fraction of a cell
 
@@ -140,7 +149,17 @@ function store(k, v) {
 }
 codeEl.value = store("dmcode") || "";
 $("gmcode").value = store("gmcode") || "";
-codeEl.addEventListener("change", () => store("dmcode", codeEl.value));
+codeEl.addEventListener("change", () => { store("dmcode", codeEl.value); shareCode(); openStream(); fetchLog(); });
+
+// The GM's panel puts the player access code into the room's shared data, so players never type it.
+async function shareCode() {
+  if (!isGmRole || !OBR.isAvailable || !codeEl.value) return;
+  try {
+    await ready;
+    const meta = await OBR.room.getMetadata();
+    if (meta[ACCESS] !== codeEl.value) await OBR.room.setMetadata({ [ACCESS]: codeEl.value });
+  } catch (e) { console.error("share code", e); }
+}
 
 // Minimal, safe markdown: HTML is escaped first, then bold, italic, code, headings and bullets are added.
 function md(t) {
@@ -216,8 +235,9 @@ async function tryRestore() {
   } catch (e) {} finally { restoring = false; }
 }
 
+let again = false;
 async function fetchLog() {
-  if (inflight) return;
+  if (inflight) { again = true; return; }
   inflight = true;
   try {
     const d = await api(`/api/log?room=${encodeURIComponent(roomId)}&since=${last}`, null, isGmRole && !!$("gmcode").value);
@@ -235,11 +255,58 @@ async function fetchLog() {
     if (d.latest === 0) tryRestore();
     if (isGmRole && Array.isArray(d.actions)) handleActions(d.actions);
   } catch (e) {
-    if (e.message !== lastErr) { add("sys", e.message); lastErr = e.message; }
+    let msg = e.message;
+    if (/access code/i.test(msg)) msg = isGmRole
+      ? "Enter the player access code in GM tools (it is shared with your players automatically)."
+      : "Waiting for the GM: the GM needs to open this panel so the access code is shared with you.";
+    if (msg !== lastErr) { add("sys", msg); lastErr = msg; }
   } finally {
     inflight = false;
     refreshUi();
+    if (again) { again = false; setTimeout(fetchLog, 50); }
   }
+}
+
+/* ---------- live updates (with polling as a backup) ---------- */
+let streamOk = false, streamCtrl = null, lastStreamData = 0, streamRetry = null;
+async function openStream() {
+  if (streamCtrl) streamCtrl.abort();
+  clearTimeout(streamRetry);
+  const ctrl = new AbortController();
+  streamCtrl = ctrl;
+  try {
+    const r = await fetch(`/api/stream?room=${encodeURIComponent(roomId)}`, {
+      headers: { "X-Access-Code": codeEl.value }, signal: ctrl.signal, cache: "no-store",
+    });
+    if (!r.ok || !r.body) throw new Error("no stream");
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    streamOk = true; lastStreamData = Date.now();
+    fetchLog();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      lastStreamData = Date.now();
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const ev = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        if (/^data:/m.test(ev)) fetchLog();
+      }
+    }
+  } catch (e) {}
+  if (streamCtrl === ctrl) {
+    streamOk = false; streamCtrl = null;
+    streamRetry = setTimeout(openStream, 5000);
+  }
+}
+let tick = 0;
+function poll() {
+  tick++;
+  // If the stream went quiet (no heartbeat for 45 s), treat it as broken and reconnect.
+  if (streamOk && Date.now() - lastStreamData > 45000) { streamOk = false; openStream(); }
+  if (!streamOk || tick % 5 === 0) fetchLog(); // every 3 s without a stream, every 15 s with one
 }
 
 /* ---------- map helpers ---------- */
@@ -305,7 +372,9 @@ async function askDm() {
   askBusy = true; refreshUi();
   try {
     const map = useMap.checked ? await mapContext() : "";
-    await api("/api/dm", { room: roomId, map });
+    let creatures = [];
+    try { creatures = (await readTokens()).filter((t) => t.side !== "pc").map((t) => t.name); } catch (e) {}
+    await api("/api/dm", { room: roomId, map, creatures });
   } catch (e) { add("sys", "Problem: " + e.message); }
   askBusy = false;
   await fetchLog();
@@ -464,7 +533,8 @@ function featureOwner(spec, f) {
 async function syncAdv() {
   const adv = advGet();
   if (!adv) return;
-  await api("/api/gm/state", { room: roomId, layout: layoutText(adv.spec), areas: adv.spec.areas.map((a) => a.name), revealed: adv.revealed }, true);
+  const creatures = [...new Set((adv.tokens || []).map((t) => String(t.name).replace(/\s+\d+$/, "")))];
+  await api("/api/gm/state", { room: roomId, layout: layoutText(adv.spec), areas: adv.spec.areas.map((a) => a.name), revealed: adv.revealed, creatures }, true);
 }
 
 // Covers every cell that is NOT a revealed area with solid "rock", so the painted art only shows inside revealed rooms.
@@ -656,6 +726,15 @@ busyBtn($("addArt"), "Painting...", async () => {
   advSet(adv);
   await updateMask();
   gmStatus(adv.art ? "Art added. Revealed rooms keep their creatures." : "The picture could not be loaded. The flat map was kept.");
+});
+
+busyBtn($("statsBtn"), "Looking up...", async () => {
+  let creatures = [];
+  try { creatures = (await readTokens()).filter((t) => t.side !== "pc").map((t) => t.name); } catch (e) {}
+  try { await syncAdv(); } catch (e) {}
+  const d = await api("/api/gm/stats", { room: roomId, creatures }, true);
+  $("stats").textContent = d.text;
+  gmStatus("Stat blocks loaded. The DM uses these automatically.");
 });
 
 busyBtn($("spawn"), "Spawning...", async () => {
@@ -929,8 +1008,23 @@ async function handleActions(list) {
     } catch (e) {}
   }
   if (isGm) $("gmToggle").hidden = false;
+  if (OBR.isAvailable) {
+    try {
+      if (isGm) await shareCode();
+      else {
+        const meta = await OBR.room.getMetadata();
+        if (meta[ACCESS]) codeEl.value = meta[ACCESS];
+      }
+      OBR.room.onMetadataChange((meta) => {
+        if (!isGmRole && meta[ACCESS] && meta[ACCESS] !== codeEl.value) {
+          codeEl.value = meta[ACCESS]; lastErr = ""; openStream(); fetchLog();
+        }
+      });
+    } catch (e) { console.error(e); }
+  }
   fetchLog();
-  setInterval(fetchLog, 3000);
+  openStream();
+  setInterval(poll, 3000);
 })();
 </script>
 </body>

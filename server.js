@@ -21,6 +21,7 @@ const SYSTEM_PROMPT = `You are the Dungeon Master for a group of several players
 - Play NPCs and monsters in character. Stay consistent with what has already happened in this chat.
 - You cannot roll dice. When a roll is needed, tell the players exactly what to roll (e.g. "Roll a DC 13 Dexterity save") and wait for the results.
 - If you are not sure about a rule, say so and give your best ruling instead of inventing an exact rule.
+- If MONSTER STAT BLOCKS are provided, use those exact numbers for attacks, damage, saves and abilities. Never tell players a monster's exact HP, AC or stat numbers; describe how hurt it looks instead.
 - Each player message begins with that player's name. Several players may act in one round: respond to all of them, addressing players by name.
 - If a map snapshot is provided, use it for positions. Distances are in grid cells (1 cell = 5 ft).
 - When new enemies or NPCs appear, say clearly who and how many so the GM can place their tokens.
@@ -109,6 +110,24 @@ function getRoom(id) {
 function addMsg(r, role, who, text) {
   r.msgs.push({ id: r.next++, role, who, text });
   if (r.msgs.length > 200) r.msgs.splice(0, r.msgs.length - 200);
+  notify(r);
+}
+
+// Live updates: each open panel keeps one stream open; we send a tiny "something changed" ping and the panel fetches the log.
+const streams = {};
+function notify(r) {
+  const set = streams[r.id];
+  if (!set) return;
+  for (const res of set) { try { res.write("data: u\n\n"); } catch (e) {} }
+}
+function openStream(req, res, r) {
+  const set = (streams[r.id] = streams[r.id] || new Set());
+  if (set.size >= 60) return json(res, 429, { error: "Too many open panels." });
+  res.writeHead(200, { ...headers("text/event-stream"), "Cache-Control": "no-cache, no-transform", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+  res.write(": hello\n\n");
+  set.add(res);
+  const beat = setInterval(() => { try { res.write(": ping\n\n"); } catch (e) {} }, 20000);
+  req.on("close", () => { clearInterval(beat); set.delete(res); if (!set.size) delete streams[r.id]; });
 }
 
 function headers(type) {
@@ -206,6 +225,112 @@ function recentStory(r, n) {
   return r.msgs.slice(-n).map((m) => (m.role === "dm" ? "DM: " : m.who + ": ") + m.text).join("\n");
 }
 
+
+// ---------- Official stat blocks (SRD via the free Open5e API) ----------
+// 2024 rules first (SRD 5.2), then 2014 (SRD 5.1). Results are cached for the life of the server.
+const SRD_URL = "https://api.open5e.com/v2/creatures/";
+const statCache = new Map();
+async function srdQuery(params) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const resp = await fetch(SRD_URL + "?" + new URLSearchParams({ ...params, limit: "20" }), { headers: { Accept: "application/json" }, signal: ctrl.signal });
+    if (!resp.ok) throw new Error("SRD " + resp.status);
+    const d = await resp.json();
+    return Array.isArray(d.results) ? d.results : [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+const baseName = (n) => String(n || "").replace(/\s+#?\d+$/, "").replace(/\s+/g, " ").trim();
+async function lookupCreature(name) {
+  const want = baseName(name);
+  const key = want.toLowerCase();
+  if (!key) return null;
+  if (statCache.has(key)) return statCache.get(key);
+  const words = key.split(" ");
+  const tries = [];
+  for (const n of [key, ...(words.length > 1 ? [words[words.length - 1], words[0]] : [])]) {
+    tries.push(["srd-2024", { name__iexact: n }], ["srd-2014", { name__iexact: n }]);
+    // 2024 renamed some monsters (e.g. "Goblin" became "Goblin Warrior")
+    if (n === key) tries.push(["srd-2024", { name__icontains: n }, true]);
+  }
+  let found = null, failed = false;
+  for (const [doc, q, loose] of tries) {
+    try {
+      let res = await srdQuery({ ...q, document__key__in: doc });
+      if (loose) res = res.filter((c) => String(c.name).toLowerCase().startsWith(key)).sort((a, b) => a.name.length - b.name.length);
+      if (res.length) { found = res[0]; break; }
+    } catch (e) { failed = true; break; }
+  }
+  const out = found ? { asked: want, data: found } : null;
+  if (found || !failed) statCache.set(key, out);
+  if (statCache.size > 300) statCache.delete(statCache.keys().next().value);
+  return out;
+}
+function crText(cr) {
+  const n = Number(cr);
+  if (n === 0.125) return "1/8";
+  if (n === 0.25) return "1/4";
+  if (n === 0.5) return "1/2";
+  return isFinite(n) ? String(n) : "?";
+}
+function formatStat(hit) {
+  const c = hit.data || {};
+  const sign = (v) => (v >= 0 ? "+" : "") + v;
+  const ed = c.document && c.document.key === "srd-2024" ? "2024" : "2014";
+  const lines = [];
+  let head = `${c.name} [${ed} rules]`;
+  if (String(c.name).toLowerCase() !== hit.asked.toLowerCase()) head += ` (closest official match for "${hit.asked}")`;
+  lines.push(head + ` - ${(c.size && c.size.name) || ""} ${(c.type && c.type.name) || ""}, CR ${crText(c.challenge_rating)}`.replace(/\s+,/, ","));
+  lines.push(`AC ${c.armor_class}${c.armor_detail ? " (" + c.armor_detail + ")" : ""}, HP ${c.hit_points}${c.hit_dice ? " (" + c.hit_dice + ")" : ""}, Initiative ${sign(c.initiative_bonus || 0)}`);
+  const sp = c.speed_all || c.speed || {};
+  const speeds = ["walk", "fly", "swim", "climb", "burrow"].filter((k) => Number(sp[k]) > 0).map((k) => `${k} ${sp[k]} ft`);
+  if (speeds.length) lines.push("Speed " + speeds.join(", "));
+  const ab = c.ability_scores || {}, mods = c.modifiers || {};
+  const short = { strength: "STR", dexterity: "DEX", constitution: "CON", intelligence: "INT", wisdom: "WIS", charisma: "CHA" };
+  const abl = Object.keys(short).filter((k) => ab[k] !== undefined).map((k) => `${short[k]} ${ab[k]} (${sign(mods[k] !== undefined ? mods[k] : Math.floor((ab[k] - 10) / 2))})`);
+  if (abl.length) lines.push(abl.join(" "));
+  const skills = Object.entries(c.skill_bonuses || {}).map(([k, v]) => `${k} ${sign(v)}`);
+  if (skills.length) lines.push("Skills " + skills.join(", "));
+  const ri = c.resistances_and_immunities || {};
+  for (const [k, label] of [["damage_resistances_display", "Resistances"], ["damage_immunities_display", "Immunities"], ["damage_vulnerabilities_display", "Vulnerabilities"], ["condition_immunities_display", "Condition immunities"]])
+    if (typeof ri[k] === "string" && ri[k].trim()) lines.push(`${label} ${ri[k].trim()}`);
+  const senses = [];
+  if (c.darkvision_range) senses.push(`darkvision ${c.darkvision_range} ft`);
+  if (c.blindsight_range) senses.push(`blindsight ${c.blindsight_range} ft`);
+  if (c.tremorsense_range) senses.push(`tremorsense ${c.tremorsense_range} ft`);
+  if (c.truesight_range) senses.push(`truesight ${c.truesight_range} ft`);
+  if (c.passive_perception) senses.push(`passive Perception ${c.passive_perception}`);
+  if (senses.length) lines.push("Senses " + senses.join(", "));
+  const clip = (t) => String(t || "").replace(/\s+/g, " ").trim().slice(0, 320);
+  for (const t of (Array.isArray(c.traits) ? c.traits : []).slice(0, 6)) lines.push(`Trait - ${t.name}: ${clip(t.desc)}`);
+  const kinds = { ACTION: "Action", BONUS_ACTION: "Bonus action", REACTION: "Reaction", LEGENDARY_ACTION: "Legendary action" };
+  const acts = (Array.isArray(c.actions) ? c.actions : []).slice().sort((a, b) => (a.order_in_statblock || 0) - (b.order_in_statblock || 0)).slice(0, 10);
+  for (const a of acts) lines.push(`${kinds[a.action_type] || "Action"} - ${a.name}: ${clip(a.desc)}`);
+  return lines.join("\n").slice(0, 2200);
+}
+function creatureNames(r, fromClient) {
+  const list = [...(Array.isArray(fromClient) ? fromClient : []), ...((r.adv && r.adv.creatures) || [])];
+  const seen = new Set(), out = [];
+  for (const n of list) {
+    const b = baseName(str(n, 60));
+    if (b && !seen.has(b.toLowerCase())) { seen.add(b.toLowerCase()); out.push(b); }
+  }
+  return out.slice(0, 10);
+}
+async function statsBlock(names, cap, plain) {
+  if (!names.length) return "";
+  const hits = await Promise.all(names.map((n) => lookupCreature(n).catch(() => null)));
+  const blocks = hits.filter(Boolean).map(formatStat);
+  const missing = names.filter((n, i) => !hits[i]);
+  if (!blocks.length && !plain) return "";
+  let text = blocks.join("\n\n");
+  if (missing.length) text += (text ? "\n\n" : "") + "No official stat block found for: " + missing.join(", ") + (plain ? " (the DM improvises these)." : ". Improvise sensible stats for these.");
+  text = text.slice(0, cap || 7000);
+  return plain ? text : "\n\nMONSTER STAT BLOCKS (official D&D SRD; use these exact numbers):\n" + text;
+}
+
 // ---------- Map + moves helpers ----------
 function sanitizeMap(s) {
   s = s || {};
@@ -241,13 +366,13 @@ Rules:
 - Lay out EVERY scene or location in the adventure notes, in story order, from one end of the map to the other. Name each main area after its scene or location (for example "Scene 1: Flooded Entry"). Link areas with corridors (kind "corridor", 2 cells wide) so everything is reachable.
 - Use 6 to 16 areas. Rooms should be at least 5x5 cells, and big encounter rooms 8x8 or larger. Leave empty space between rooms.
 - Put "features" inside areas: cover, hazards, doors at area edges, and interesting objects that fit the story. Use 10 to 40 features. Keep each 1 to 3 cells.
-- "creatures": include EVERY monster and NPC from the notes, in the area where the party meets them. Use the exact area name. Use the counts in the notes (maximum 12 per entry). Give the creature name without numbers. Leave out the player characters.`;
+- "creatures": include EVERY monster and NPC from the notes, in the area where the party meets them. Use the exact area name. Use the counts in the notes (maximum 12 per entry). Give the creature name without numbers. Use the official D&D 2024 (SRD 5.2) monster name when one fits (for example "Goblin Warrior", "Bandit", "Skeleton", "Cultist"), so the creature's official stats can be looked up. Leave out the player characters.`;
 
 const MOVES_SYSTEM = `You control the enemies and NPCs in a tabletop D&D (2024, 5.5e) combat. Output ONLY valid JSON, no commentary.
 Schema: {"summary": string (one sentence on the enemy plan), "moves": [{"id": string, "col": int, "row": int, "reason": string (max 12 words)}]}
 Rules:
 - Only move tokens whose side is "enemy", "npc" or "ally". Tokens with side "pc" are the players: never move them.
-- Grid cells: 1 cell = 5 ft. Unless told otherwise, a token can move at most 6 cells per turn (diagonals count as 1 cell).
+- Grid cells: 1 cell = 5 ft. If a creature's stat block gives a walking speed, it can move at most that many feet / 5 cells per turn; otherwise at most 6 cells (diagonals count as 1 cell).
 - Only end on walkable floor (inside a listed area, or anywhere if no map is given). Do not end on a cell with a token or on a blocking feature (pillar, statue, table, water, tree, altar, chest).
 - Play tactically but fairly: use cover, focus weak targets, protect leaders, and avoid unrealistic coordination. Cowardly or injured creatures may retreat.
 - You may omit tokens that should stay put.`;
@@ -319,6 +444,7 @@ async function handleApi(req, res, url, query) {
       const since = parseInt(query.get("since") || "0", 10) || 0;
       return json(res, 200, { msgs: r.msgs.filter((m) => m.id > since), latest: r.next - 1, busy: r.busy, ...(isGm(req) ? { actions: r.pending } : {}) });
     }
+    if (req.method === "GET" && url === "/api/stream") return openStream(req, res, getRoom(query.get("room")));
     if (req.method === "GET" && url === "/api/gm/brief") {
       if (!needGm(req, res)) return;
       return json(res, 200, { brief: getRoom(query.get("room")).brief });
@@ -346,9 +472,11 @@ async function handleApi(req, res, url, query) {
         return json(res, 400, { error: "Nothing new for the DM to respond to. Have players say what they do first." });
       const map = str(body.map, 5000);
       r.busy = true;
+      notify(r);
       try {
+        const stats = await statsBlock(creatureNames(r, body.creatures));
         const raw = await gemini({
-          system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + advBlock(r) + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
+          system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + advBlock(r) + stats + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
           contents: buildContents(r.msgs),
           json: true,
           maxTokens: 4096,
@@ -366,6 +494,7 @@ async function handleApi(req, res, url, query) {
         r.pending = r.pending.slice(-30);
       } finally {
         r.busy = false;
+        notify(r);
       }
       return json(res, 200, { ok: true });
     }
@@ -390,6 +519,7 @@ async function handleApi(req, res, url, query) {
       r.msgs = [];
       r.next = 1;
       r.pending = [];
+      notify(r);
       return json(res, 200, { ok: true });
     }
 
@@ -400,7 +530,8 @@ async function handleApi(req, res, url, query) {
 
     if (url === "/api/gm/state") {
       const names = (v) => (Array.isArray(v) ? v : []).slice(0, 40).map((x) => str(x, 60)).filter(Boolean);
-      r.adv = { layout: str(body.layout, 4000), areas: names(body.areas), revealed: names(body.revealed) };
+      r.adv = { layout: str(body.layout, 4000), areas: names(body.areas), revealed: names(body.revealed), creatures: names(body.creatures) };
+      r.adv.creatures.slice(0, 12).forEach((n) => lookupCreature(n).catch(() => {}));
       return json(res, 200, { ok: true });
     }
 
@@ -414,9 +545,15 @@ async function handleApi(req, res, url, query) {
       return json(res, 200, { url: `/art/${encodeURIComponent(r.id)}.jpg?v=${r.artV}`, mime: r.art.type.split(";")[0] });
     }
 
+    if (url === "/api/gm/stats") {
+      const text = await statsBlock(creatureNames(r, body.creatures), 12000, true);
+      return json(res, 200, { text: text || "No official stat blocks found for the creatures on the map or in your built adventure." });
+    }
+
     if (url === "/api/gm/actions/resolve") {
       const ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(Number));
       r.pending = r.pending.filter((a) => !ids.has(a.id));
+      notify(r);
       return json(res, 200, { ok: true });
     }
 
@@ -433,7 +570,7 @@ async function handleApi(req, res, url, query) {
           `Design a self-contained one-shot for ${players} players at level ${level}. Theme and tone: ${theme}.\n` +
           `It must be finishable in about 3 hours. Use these headings:\n` +
           `PREMISE AND HOOK\nSECRETS AND TWISTS (GM only)\nSCENES (3 or 4; for each: goal, challenge, NPCs, what the map needs)\n` +
-          `MONSTERS (name, CR, AC, HP, attacks with bonuses and damage, special traits)\nTREASURE\nENDINGS\n` +
+          `MONSTERS (prefer official D&D 2024 monster names, e.g. "Goblin Warrior" rather than "Goblin"; name, CR, AC, HP, attacks with bonuses and damage, special traits)\nTREASURE\nENDINGS\n` +
           `Keep it under 900 words. Be concrete: names, numbers, DCs.`
         ),
       });
@@ -473,6 +610,7 @@ async function handleApi(req, res, url, query) {
       const cols = clampInt(body.cols, 10, 200, 40);
       const rows = clampInt(body.rows, 8, 200, 30);
       const situation = str(body.situation, 500);
+      const stats = await statsBlock(creatureNames(r, movable.map((k) => k.name)), 5000);
       const t = await gemini({
         model: PLAN_MODEL,
         json: true,
@@ -481,7 +619,7 @@ async function handleApi(req, res, url, query) {
           (str(body.layout, 4000) ? `${str(body.layout, 4000)}\n\n` : "") +
           `Tokens (col,row are grid cells):\n` + tokens.map((k) => `- id=${k.id} name="${k.name}" side=${k.side} at (${k.col},${k.row})`).join("\n") +
           (situation ? `\n\nGM note: ${situation}` : "") +
-          `\n\nRecent story:\n${recentStory(r, 8)}` + briefBlock(r)
+          `\n\nRecent story:\n${recentStory(r, 8)}` + briefBlock(r) + stats
         ),
       });
       const parsed = parseJson(t);
