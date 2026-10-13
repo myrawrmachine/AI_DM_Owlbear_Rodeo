@@ -26,11 +26,44 @@ const SYSTEM_PROMPT = `You are the Dungeon Master for a group of several players
 - When new enemies or NPCs appear, say clearly who and how many so the GM can place their tokens.
 - End scenes with a prompt like "What do you do?"`;
 
+const ACTIONS_PROMPT = `
+
+OUTPUT FORMAT: reply with ONLY valid JSON: {"narration": string, "actions": [ ... ]}
+- "narration" is what you say to the players (markdown allowed). Never reveal secret notes in it.
+- "actions" is optional (use [] when nothing is needed). The GM approves actions before anything happens, so only propose them when the story clearly calls for it. At most 6.
+- Use grid cells from the map snapshot (col and row start at 0 in the top-left).
+- Action types:
+  {"type":"spawn","name":"Goblin","count":3,"side":"enemy"|"npc"|"ally","col":int,"row":int}   (creatures that enter the scene now)
+  {"type":"move","name":"Goblin 1","col":int,"row":int,"reason":"short"}   (only enemy/npc/ally tokens, never player characters)
+  {"type":"delete","name":"Goblin 2"}   (remove a defeated or departed creature; never a player character)
+  {"type":"fog","on":true|false}   (true = cover the whole scene in fog, false = clear it)
+  {"type":"camera","name":"Cult Leader"}  or  {"type":"camera","col":int,"row":int}   (focus everyone's view)
+  {"type":"light","name":"Ann","radius":4}   (give a token a light, radius in cells)`;
+
+function sanitizeActions(list) {
+  const out = [];
+  for (const a of (Array.isArray(list) ? list : []).slice(0, 6)) {
+    if (!a || typeof a !== "object") continue;
+    const type = str(a.type, 12);
+    const name = str(a.name, 40);
+    if (type === "spawn" && name)
+      out.push({ type, name, count: clampInt(a.count, 1, 12, 1), side: ["enemy", "npc", "ally"].includes(a.side) ? a.side : "enemy", col: clampInt(a.col, 0, 200, 0), row: clampInt(a.row, 0, 200, 0) });
+    else if (type === "move" && name)
+      out.push({ type, name, col: clampInt(a.col, 0, 200, 0), row: clampInt(a.row, 0, 200, 0), reason: str(a.reason, 80) });
+    else if (type === "delete" && name) out.push({ type, name });
+    else if (type === "fog") out.push({ type, on: a.on === true || a.on === "true" });
+    else if (type === "camera" && (name || (isFinite(Number(a.col)) && isFinite(Number(a.row)))))
+      out.push({ type, name, col: clampInt(a.col, 0, 200, 0), row: clampInt(a.row, 0, 200, 0) });
+    else if (type === "light" && name) out.push({ type, name, radius: clampInt(a.radius, 1, 12, 3) });
+  }
+  return out;
+}
+
 // Everything lives in memory, one entry per Owlbear room. It resets if the server restarts or sleeps.
 const rooms = {};
 function getRoom(id) {
   id = String(id || "default").slice(0, 100);
-  if (!rooms[id]) rooms[id] = { msgs: [], next: 1, busy: false, brief: "" };
+  if (!rooms[id]) rooms[id] = { msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1 };
   return rooms[id];
 }
 function addMsg(r, role, who, text) {
@@ -234,7 +267,7 @@ async function handleApi(req, res, url, query) {
     if (req.method === "GET" && url === "/api/log") {
       const r = getRoom(query.get("room"));
       const since = parseInt(query.get("since") || "0", 10) || 0;
-      return json(res, 200, { msgs: r.msgs.filter((m) => m.id > since), latest: r.next - 1, busy: r.busy });
+      return json(res, 200, { msgs: r.msgs.filter((m) => m.id > since), latest: r.next - 1, busy: r.busy, ...(isGm(req) ? { actions: r.pending } : {}) });
     }
     if (req.method === "GET" && url === "/api/gm/brief") {
       if (!needGm(req, res)) return;
@@ -264,14 +297,37 @@ async function handleApi(req, res, url, query) {
       const map = str(body.map, 5000);
       r.busy = true;
       try {
-        const reply = await gemini({
-          system: SYSTEM_PROMPT + briefBlock(r) + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
+        const raw = await gemini({
+          system: SYSTEM_PROMPT + ACTIONS_PROMPT + briefBlock(r) + (map ? "\n\nCurrent map snapshot:\n" + map : ""),
           contents: buildContents(r.msgs),
-          maxTokens: 2048,
+          json: true,
+          maxTokens: 4096,
         });
-        addMsg(r, "dm", "DM", reply);
+        let narration = raw, actions = [];
+        try {
+          const p = parseJson(raw);
+          if (p && typeof p.narration === "string" && p.narration.trim()) {
+            narration = p.narration.trim();
+            actions = sanitizeActions(p.actions);
+          }
+        } catch (e) {}
+        addMsg(r, "dm", "DM", narration);
+        actions.forEach((a) => r.pending.push({ id: r.aseq++, ...a }));
+        r.pending = r.pending.slice(-30);
       } finally {
         r.busy = false;
+      }
+      return json(res, 200, { ok: true });
+    }
+
+    if (url === "/api/restore") {
+      if (r.msgs.length) return json(res, 200, { ok: false });
+      const list = (Array.isArray(body.msgs) ? body.msgs : []).slice(-60);
+      for (const m of list) {
+        const text = str(m && m.text, 1500);
+        if (!text) continue;
+        if (m.role === "dm") addMsg(r, "dm", "DM", text);
+        else addMsg(r, "player", str(m.who, 40) || "Player", text);
       }
       return json(res, 200, { ok: true });
     }
@@ -283,12 +339,19 @@ async function handleApi(req, res, url, query) {
     if (url === "/api/clear") {
       r.msgs = [];
       r.next = 1;
+      r.pending = [];
       return json(res, 200, { ok: true });
     }
 
     if (url === "/api/gm/brief") {
       r.brief = str(body.brief, 12000);
       return json(res, 200, { ok: true, length: r.brief.length });
+    }
+
+    if (url === "/api/gm/actions/resolve") {
+      const ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(Number));
+      r.pending = r.pending.filter((a) => !ids.has(a.id));
+      return json(res, 200, { ok: true });
     }
 
     if (!API_KEY) return json(res, 500, { error: "Server has no GEMINI_API_KEY set." });

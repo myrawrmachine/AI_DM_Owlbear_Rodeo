@@ -37,6 +37,10 @@
   #legend { font-size: 12px; color: #c7c9d9; white-space: pre-wrap; margin-top: 6px; }
   .move { display: flex; gap: 6px; align-items: center; margin: 4px 0; font-size: 13px; }
   .move span { flex: 1; }
+  #actions { margin: 0 10px 6px; padding: 8px; background: #2a3045; border: 1px solid #b8862b; border-radius: 8px; font-size: 13px; }
+  #actions .arow { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+  #actions .arow span { flex: 1; }
+  #actions button { height: 28px; font-size: 12px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -45,9 +49,11 @@
 <div id="story">
   <div id="log"><div class="msg dm">Welcome, adventurers. Each player: type what your character does and press Say. When everyone has spoken, one person presses Ask DM.</div></div>
   <div id="status"></div>
+  <div id="actions" hidden></div>
   <div class="row small">
     <label for="code">Access code</label><input id="code" type="password">
     <label><input type="checkbox" id="useMap" checked> send map</label>
+    <label><input type="checkbox" id="followCam" checked> follow DM camera</label>
     <button id="gmToggle" class="alt" hidden>GM tools</button>
   </div>
   <div class="row">
@@ -100,7 +106,7 @@
 </div>
 
 <script type="module">
-import OBR, { buildShape, buildLabel } from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm";
+import OBR, { buildShape, buildLabel, buildLight } from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm";
 
 const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("input"), codeEl = $("code"), useMap = $("useMap");
@@ -109,10 +115,16 @@ const sayBtn = $("sayBtn"), askBtn = $("askBtn"), status = $("status");
 const GEN = "com.aidm/generated";
 const SIDE = "com.aidm/side";
 const AUTO = "com.aidm/auto";
+const FOR = "com.aidm/for";
+const STORY = "com.aidm/story";
+const CAM = "com.aidm/camera";
+const LIGHT = "com.aidm/light";
 const OFF = 0.05; // token inset, as a fraction of a cell
 
 let last = 0, roomId = "test-room", myName = "Player", lastErr = "", inflight = false, serverBusy = false, askBusy = false;
 let dpiCache = 0, pendingMoves = [], tokenNames = {};
+let isGmRole = false, msgCache = [], saveTimer = null, restoring = false;
+const lights = {};
 
 const ready = OBR.isAvailable ? new Promise((r) => OBR.onReady(r)) : Promise.resolve();
 
@@ -160,20 +172,61 @@ function refreshUi() {
   status.textContent = thinking ? "The DM is thinking..." : "";
 }
 
+function trimStory(msgs) {
+  const out = [];
+  let size = 0;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = { r: msgs[i].r, w: msgs[i].w, t: String(msgs[i].t).slice(0, 800) };
+    const n = JSON.stringify(m).length + 1;
+    if (size + n > 8000) break;
+    size += n;
+    out.unshift(m);
+  }
+  return out;
+}
+
+function scheduleSave() {
+  if (!isGmRole || !OBR.isAvailable || saveTimer) return;
+  saveTimer = setTimeout(async () => {
+    saveTimer = null;
+    try { await OBR.room.setMetadata({ [STORY]: trimStory(msgCache) }); } catch (e) {}
+  }, 3000);
+}
+
+async function tryRestore() {
+  if (restoring || !OBR.isAvailable) return;
+  restoring = true;
+  try {
+    await ready;
+    const story = (await OBR.room.getMetadata())[STORY];
+    if (Array.isArray(story) && story.length) {
+      await api("/api/restore", {
+        room: roomId,
+        msgs: story.map((m) => ({ role: m.r === "d" ? "dm" : "player", who: m.w, text: m.t })),
+      });
+      setTimeout(fetchLog, 300);
+    }
+  } catch (e) {} finally { restoring = false; }
+}
+
 async function fetchLog() {
   if (inflight) return;
   inflight = true;
   try {
-    const d = await api(`/api/log?room=${encodeURIComponent(roomId)}&since=${last}`);
-    if (d.latest < last) { log.innerHTML = ""; last = 0; }
+    const d = await api(`/api/log?room=${encodeURIComponent(roomId)}&since=${last}`, null, isGmRole && !!$("gmcode").value);
+    if (d.latest < last) { log.innerHTML = ""; last = 0; msgCache = []; }
     else {
       for (const m of d.msgs) {
         last = m.id;
         add(m.role === "dm" ? "dm" : "you", m.role === "dm" ? m.text : `${m.who}: ${m.text}`);
+        msgCache.push({ r: m.role === "dm" ? "d" : "p", w: m.who, t: m.text });
       }
+      if (d.msgs.length) scheduleSave();
     }
     serverBusy = d.busy;
     lastErr = "";
+    if (d.latest === 0) tryRestore();
+    if (isGmRole && Array.isArray(d.actions)) handleActions(d.actions);
   } catch (e) {
     if (e.message !== lastErr) { add("sys", e.message); lastErr = e.message; }
   } finally {
@@ -337,7 +390,7 @@ async function spawnTokens(list, auto) {
       .fillOpacity(0.9).strokeColor("#ffffff").strokeWidth(3).layer("CHARACTER").name(t.name)
       .metadata(meta).build();
     const tag = buildLabel().plainText(t.name).position({ x: (t.col + 0.5) * dpi, y: t.row * dpi })
-      .attachedTo(shape.id).pointerDirection("DOWN").metadata(auto ? { [AUTO]: true } : {}).build();
+      .attachedTo(shape.id).pointerDirection("DOWN").metadata(auto ? { [AUTO]: true, [FOR]: shape.id } : { [FOR]: shape.id }).build();
     items.push(shape, tag);
   }
   if (items.length) await OBR.scene.items.addItems(items);
@@ -445,9 +498,179 @@ $("clearBtn").addEventListener("click", async () => {
     return;
   }
   clearArmed = false; b.textContent = "Clear story";
-  try { await api("/api/clear", { room: roomId }, true); gmStatus("Story cleared."); await fetchLog(); }
+  try {
+    msgCache = [];
+    try { await OBR.room.setMetadata({ [STORY]: [] }); } catch (e) {}
+    await api("/api/clear", { room: roomId }, true); gmStatus("Story cleared."); await fetchLog();
+  }
   catch (e) { gmStatus("Problem: " + e.message); }
 });
+
+/* ---------- AI actions (GM approves, camera auto-runs) ---------- */
+const handled = new Set();
+let pendingActions = [], shownKey = "";
+
+function describe(a) {
+  if (a.type === "spawn") return `Spawn ${a.count} x ${a.name} (${a.side}) near (${a.col}, ${a.row})`;
+  if (a.type === "move") return `Move ${a.name} to (${a.col}, ${a.row})${a.reason ? ": " + a.reason : ""}`;
+  if (a.type === "delete") return `Remove ${a.name}`;
+  if (a.type === "fog") return a.on ? "Cover the scene in fog" : "Clear the fog";
+  if (a.type === "light") return `Give ${a.name} a light (${a.radius} cells)`;
+  return a.type;
+}
+
+function resolveActions(ids) { api("/api/gm/actions/resolve", { room: roomId, ids }, true).catch(() => {}); }
+
+function freeCell(taken, c, r) {
+  for (let ring = 0; ring <= 6; ring++)
+    for (let dx = -ring; dx <= ring; dx++)
+      for (let dy = -ring; dy <= ring; dy++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== ring) continue;
+        const x = c + dx, y = r + dy;
+        if (x >= 0 && y >= 0 && !taken.has(x + "," + y)) return [x, y];
+      }
+  return [c, r];
+}
+
+async function focusCell(col, row, span) {
+  const dpi = await getDpi();
+  const w = span * dpi, hgt = span * 0.7 * dpi;
+  const cx = (col + 0.5) * dpi, cy = (row + 0.5) * dpi;
+  await OBR.viewport.animateToBounds({
+    min: { x: cx - w / 2, y: cy - hgt / 2 }, max: { x: cx + w / 2, y: cy + hgt / 2 },
+    width: w, height: hgt, center: { x: cx, y: cy },
+  });
+}
+
+async function addLight(id, radius) {
+  const dpi = await getDpi();
+  const found = await OBR.scene.items.getItems([id]);
+  if (!found.length) return;
+  if (lights[id]) { try { await OBR.scene.local.deleteItems([lights[id]]); } catch (e) {} }
+  const px = radius * dpi;
+  const light = buildLight().attachedTo(id).attenuationRadius(px).sourceRadius(px)
+    .lightType("PRIMARY").falloff(0.2)
+    .position({ x: found[0].position.x + dpi * 0.5, y: found[0].position.y + dpi * 0.5 }).build();
+  await OBR.scene.local.addItems([light]);
+  lights[id] = light.id;
+}
+
+async function broadcast(channel, data, fallback) {
+  try { await OBR.broadcast.sendMessage(channel, data, { destination: "ALL" }); }
+  catch (e) { await fallback(); }
+}
+
+async function runAction(a) {
+  if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room.");
+  await ready;
+  const tokens = await readTokens();
+  const lower = (s) => String(s).toLowerCase();
+  const find = (name) => {
+    const own = tokens.filter((t) => t.side !== "pc");
+    return own.find((t) => lower(t.name) === lower(name)) || own.find((t) => lower(t.name).startsWith(lower(name)));
+  };
+  if (a.type === "spawn") {
+    const taken = new Set(tokens.map((t) => t.col + "," + t.row));
+    const existing = tokens.filter((t) => lower(t.name).startsWith(lower(a.name))).length;
+    const list = [];
+    for (let i = 0; i < a.count; i++) {
+      const cell = freeCell(taken, a.col, a.row);
+      taken.add(cell.join(","));
+      const n = a.count > 1 || existing ? existing + i + 1 : 0;
+      list.push({ name: n ? `${a.name} ${n}` : a.name, side: a.side, col: cell[0], row: cell[1] });
+    }
+    await spawnTokens(list, false);
+  } else if (a.type === "move") {
+    const t = find(a.name);
+    if (!t) throw new Error(`No creature named "${a.name}" to move.`);
+    await applyMoves([{ id: t.id, col: a.col, row: a.row }]);
+  } else if (a.type === "delete") {
+    const n = lower(a.name);
+    const targets = tokens.filter((t) => t.side !== "pc" && (lower(t.name) === n || lower(t.name).startsWith(n + " ")));
+    if (!targets.length) throw new Error(`No creature named "${a.name}" to remove.`);
+    const ids = targets.map((t) => t.id);
+    const labels = await OBR.scene.items.getItems((i) => i.metadata && ids.includes(i.metadata[FOR]));
+    await OBR.scene.items.deleteItems([...ids, ...labels.map((l) => l.id)]);
+  } else if (a.type === "fog") {
+    await OBR.scene.fog.setFilled(!!a.on);
+  } else if (a.type === "camera") {
+    let col = a.col, row = a.row;
+    if (a.name) {
+      const t = find(a.name) || tokens.find((x) => lower(x.name) === lower(a.name));
+      if (!t) throw new Error(`No token named "${a.name}" to focus on.`);
+      col = t.col; row = t.row;
+    }
+    await broadcast(CAM, { col, row, span: 12 }, () => focusCell(col, row, 12));
+  } else if (a.type === "light") {
+    const t = tokens.find((x) => lower(x.name) === lower(a.name));
+    if (!t) throw new Error(`No token named "${a.name}" for a light.`);
+    await broadcast(LIGHT, { id: t.id, radius: a.radius }, () => addLight(t.id, a.radius));
+  }
+}
+
+function renderActions() {
+  const box = $("actions");
+  box.innerHTML = "";
+  if (!isGmRole || !pendingActions.length) { box.hidden = true; return; }
+  box.hidden = false;
+  const title = document.createElement("div");
+  title.textContent = "The DM suggests (you approve):";
+  box.appendChild(title);
+  pendingActions.forEach((a) => {
+    const row = document.createElement("div");
+    row.className = "arow";
+    const span = document.createElement("span");
+    span.textContent = describe(a);
+    const ok = document.createElement("button");
+    ok.textContent = "Approve";
+    ok.addEventListener("click", () => approve(a));
+    const no = document.createElement("button");
+    no.textContent = "Skip"; no.className = "alt";
+    no.addEventListener("click", () => skip(a));
+    row.append(span, ok, no);
+    box.appendChild(row);
+  });
+  if (pendingActions.length > 1) {
+    const row = document.createElement("div");
+    row.className = "arow";
+    const all = document.createElement("button");
+    all.textContent = "Approve all";
+    all.addEventListener("click", async () => { for (const a of [...pendingActions]) await approve(a); });
+    const none = document.createElement("button");
+    none.textContent = "Skip all"; none.className = "alt";
+    none.addEventListener("click", () => { [...pendingActions].forEach(skip); });
+    row.append(all, none);
+    box.appendChild(row);
+  }
+}
+
+async function approve(a) {
+  try {
+    await runAction(a);
+    handled.add(a.id); resolveActions([a.id]);
+    pendingActions = pendingActions.filter((x) => x.id !== a.id);
+    status.textContent = "";
+  } catch (e) { console.error(e); status.textContent = "Action failed: " + e.message; }
+  shownKey = ""; renderActions();
+}
+
+function skip(a) {
+  handled.add(a.id); resolveActions([a.id]);
+  pendingActions = pendingActions.filter((x) => x.id !== a.id);
+  renderActions();
+}
+
+async function handleActions(list) {
+  const auto = list.filter((a) => a.type === "camera" && !handled.has(a.id));
+  for (const a of auto) {
+    handled.add(a.id);
+    try { await runAction(a); } catch (e) { status.textContent = "Camera: " + e.message; }
+    resolveActions([a.id]);
+  }
+  pendingActions = list.filter((a) => a.type !== "camera" && !handled.has(a.id));
+  const key = pendingActions.map((a) => a.id).join(",");
+  if (key !== shownKey) { shownKey = key; renderActions(); }
+}
 
 /* ---------- start ---------- */
 (async () => {
@@ -460,6 +683,13 @@ $("clearBtn").addEventListener("click", async () => {
       isGm = (await OBR.player.getRole()) === "GM";
     }
   } catch (e) {}
+  isGmRole = isGm;
+  if (OBR.isAvailable) {
+    try {
+      OBR.broadcast.onMessage(CAM, (e) => { if ($("followCam").checked) focusCell(e.data.col, e.data.row, e.data.span || 12).catch(() => {}); });
+      OBR.broadcast.onMessage(LIGHT, (e) => { addLight(e.data.id, e.data.radius).catch(() => {}); });
+    } catch (e) {}
+  }
   if (isGm) $("gmToggle").hidden = false;
   fetchLog();
   setInterval(fetchLog, 3000);
