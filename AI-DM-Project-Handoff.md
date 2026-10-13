@@ -1648,3 +1648,7 @@ User test of v0.5: art appeared but did not line up with the grid; fog did not h
 **Next:** user uploads v0.5.2, rebuilds, reports (a) whether art now appears only inside revealed rooms and looks like floor texture, (b) players' view after revealing a room, (c) how fog was turned on (AI action, Owlbear Fill Fog button) and whether players saw the art faintly or with no fog at all. If fog-based hiding is still wanted, investigate why `OBR.scene.fog.setFilled(true)` does not hide MAP items for players.
 Remaining after that: Item 4 polish (move Access code box into GM tools, SSE instead of polling, refresh setup guide).
 
+## 17. v0.5.2 test result (2026-10-13)
+- User tested v0.5.2 with the fixed manifest: PASSED. Art shows only inside revealed rooms, and reveal works for players ("test passed with the fog reveal"). The fog question (why `setFilled` did not hide MAP items for players) is moot for now; the rock mask handles hiding.
+- Next: user picks the next feature. Options offered: (a) Item 4 polish: move the Access code box into the GM screen, Server-Sent Events instead of 3-second polling, refreshed setup guide covering everything built; (b) later-ideas list: SRD monster/rules lookup, dice + combat tracker, session-zero campaign builder, persistent storage in a free database.
+
