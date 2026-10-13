@@ -107,7 +107,7 @@ function sanitizeActions(list) {
 const rooms = {};
 function getRoom(id) {
   id = String(id || "default").slice(0, 100);
-  if (!rooms[id]) rooms[id] = { id, msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1, adv: null, art: null, artV: 0 };
+  if (!rooms[id]) rooms[id] = { id, msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1, adv: null, art: null, artV: 0, epoch: "" };
   return rooms[id];
 }
 function addMsg(r, role, who, text) {
@@ -461,7 +461,7 @@ async function handleApi(req, res, url, query) {
     if (req.method === "GET" && url === "/api/log") {
       const r = getRoom(query.get("room"));
       const since = parseInt(query.get("since") || "0", 10) || 0;
-      return json(res, 200, { msgs: r.msgs.filter((m) => m.id > since), latest: r.next - 1, busy: r.busy, ...(isGm(req) ? { actions: r.pending } : {}) });
+      return json(res, 200, { msgs: r.msgs.filter((m) => m.id > since), latest: r.next - 1, epoch: r.epoch, busy: r.busy, ...(isGm(req) ? { actions: r.pending } : {}) });
     }
     if (req.method === "GET" && url === "/api/stream") return openStream(req, res, getRoom(query.get("room")));
     if (req.method === "GET" && url === "/api/gm/brief") {
@@ -530,6 +530,10 @@ async function handleApi(req, res, url, query) {
 
     if (url === "/api/restore") {
       if (r.msgs.length) return json(res, 200, { ok: false });
+      // Each story has an ID that changes when the GM clears it. An old backup (from before a clear) is never restored.
+      const e = str(body.epoch, 40);
+      if (r.epoch && e !== r.epoch) return json(res, 200, { ok: false, stale: true });
+      if (!r.epoch && e) r.epoch = e;
       const list = (Array.isArray(body.msgs) ? body.msgs : []).slice(-60);
       for (const m of list) {
         const text = str(m && m.text, 1500);
@@ -548,8 +552,9 @@ async function handleApi(req, res, url, query) {
       r.msgs = [];
       r.next = 1;
       r.pending = [];
+      r.epoch = str(body.epoch, 40) || Math.random().toString(36).slice(2, 10);
       notify(r);
-      return json(res, 200, { ok: true });
+      return json(res, 200, { ok: true, epoch: r.epoch });
     }
 
     if (url === "/api/gm/brief") {

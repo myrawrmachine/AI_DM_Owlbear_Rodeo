@@ -139,7 +139,7 @@ const OFF = 0.05; // token inset, as a fraction of a cell
 
 let last = 0, roomId = "test-room", myName = "Player", lastErr = "", inflight = false, serverBusy = false, askBusy = false;
 let dpiCache = 0, pendingMoves = [], tokenNames = {};
-let isGmRole = false, msgCache = [], saveTimer = null, restoring = false;
+let isGmRole = false, msgCache = [], saveTimer = null, restoring = false, epoch = null;
 const lights = {};
 
 const ready = OBR.isAvailable ? new Promise((r) => OBR.onReady(r)) : Promise.resolve();
@@ -215,7 +215,7 @@ function scheduleSave() {
   if (!isGmRole || !OBR.isAvailable || saveTimer) return;
   saveTimer = setTimeout(async () => {
     saveTimer = null;
-    try { await OBR.room.setMetadata({ [STORY]: trimStory(msgCache) }); } catch (e) {}
+    try { await OBR.room.setMetadata({ [STORY]: { e: epoch || "", m: trimStory(msgCache) } }); } catch (e) {}
   }, 3000);
 }
 
@@ -224,11 +224,14 @@ async function tryRestore() {
   restoring = true;
   try {
     await ready;
-    const story = (await OBR.room.getMetadata())[STORY];
-    if (Array.isArray(story) && story.length) {
+    const saved = (await OBR.room.getMetadata())[STORY];
+    // Saved as { e: story ID, m: messages }; very old versions saved a plain list.
+    const list = Array.isArray(saved) ? saved : (saved && Array.isArray(saved.m) ? saved.m : []);
+    const e = saved && !Array.isArray(saved) ? String(saved.e || "") : "";
+    if (list.length) {
       await api("/api/restore", {
-        room: roomId,
-        msgs: story.map((m) => ({ role: m.r === "d" ? "dm" : "player", who: m.w, text: m.t })),
+        room: roomId, epoch: e,
+        msgs: list.map((m) => ({ role: m.r === "d" ? "dm" : "player", who: m.w, text: m.t })),
       });
       setTimeout(fetchLog, 300);
     }
@@ -241,8 +244,13 @@ async function fetchLog() {
   inflight = true;
   try {
     const d = await api(`/api/log?room=${encodeURIComponent(roomId)}&since=${last}`, null, isGmRole && !!$("gmcode").value);
-    if (d.latest < last) { log.innerHTML = ""; last = 0; msgCache = []; }
-    else {
+    const newStory = epoch !== null && (d.epoch || "") !== epoch;
+    epoch = d.epoch || "";
+    if (newStory || d.latest < last) {
+      // The GM cleared the story: wipe the screen and fetch again from the start.
+      log.innerHTML = ""; last = 0; msgCache = [];
+      again = true;
+    } else {
       for (const m of d.msgs) {
         last = m.id;
         add(m.role === "dm" ? "dm" : "you", m.role === "dm" ? m.text : `${m.who}: ${m.text}`);
@@ -840,14 +848,20 @@ $("clearBtn").addEventListener("click", async () => {
   const b = $("clearBtn");
   if (!clearArmed) {
     clearArmed = true; b.textContent = "Really clear?";
+    gmStatus("Press \"Really clear?\" again within 4 seconds to erase the story for everyone.");
     setTimeout(() => { clearArmed = false; b.textContent = "Clear story"; }, 4000);
     return;
   }
   clearArmed = false; b.textContent = "Clear story";
   try {
+    const fresh = Math.random().toString(36).slice(2, 10);
+    clearTimeout(saveTimer); saveTimer = null;
     msgCache = [];
-    try { await OBR.room.setMetadata({ [STORY]: [] }); } catch (e) {}
-    await api("/api/clear", { room: roomId }, true); gmStatus("Story cleared."); await fetchLog();
+    try { await OBR.room.setMetadata({ [STORY]: { e: fresh, m: [] } }); } catch (e) {}
+    await api("/api/clear", { room: roomId, epoch: fresh }, true);
+    epoch = fresh; log.innerHTML = ""; last = 0;
+    gmStatus("Story cleared for everyone.");
+    await fetchLog();
   }
   catch (e) { gmStatus("Problem: " + e.message); }
 });

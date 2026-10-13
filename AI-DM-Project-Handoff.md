@@ -96,7 +96,7 @@ No LICENSE file is in the ZIP, so do NOT copy their code or art assets. Use it o
 **Implications for our steps:** Step 2 (history): store a TRIMMED copy in room metadata (their unbounded array is a known risk); never store the brief there. Step 3 (actions): use their action list as the checklist, run with GM approval, bundled in the Ask DM request. Step 4 (fog): only whole-scene fog on/off and token lights are proven; fine-grained reveals need FOG-layer items, unverified. Step 7 (map art): `insertMap` approach is proven; we still need a free image source and hosting.
 
 ## 7. Full source code (current)
-Create each file with exactly these contents (current version: v0.6.1). `icon.svg` and `package.json` are unchanged since the first version.
+Create each file with exactly these contents (current version: v0.6.2). `icon.svg` and `package.json` are unchanged since the first version.
 
 ### package.json
 
@@ -116,7 +116,7 @@ Create each file with exactly these contents (current version: v0.6.1). `icon.sv
 ```json
 {
   "name": "AI Dungeon Master",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "manifest_version": 1,
   "description": "An AI DM that narrates, drafts one-shots, draws maps and suggests enemy moves.",
   "author": "You",
@@ -250,7 +250,7 @@ function sanitizeActions(list) {
 const rooms = {};
 function getRoom(id) {
   id = String(id || "default").slice(0, 100);
-  if (!rooms[id]) rooms[id] = { id, msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1, adv: null, art: null, artV: 0 };
+  if (!rooms[id]) rooms[id] = { id, msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1, adv: null, art: null, artV: 0, epoch: "" };
   return rooms[id];
 }
 function addMsg(r, role, who, text) {
@@ -604,7 +604,7 @@ async function handleApi(req, res, url, query) {
     if (req.method === "GET" && url === "/api/log") {
       const r = getRoom(query.get("room"));
       const since = parseInt(query.get("since") || "0", 10) || 0;
-      return json(res, 200, { msgs: r.msgs.filter((m) => m.id > since), latest: r.next - 1, busy: r.busy, ...(isGm(req) ? { actions: r.pending } : {}) });
+      return json(res, 200, { msgs: r.msgs.filter((m) => m.id > since), latest: r.next - 1, epoch: r.epoch, busy: r.busy, ...(isGm(req) ? { actions: r.pending } : {}) });
     }
     if (req.method === "GET" && url === "/api/stream") return openStream(req, res, getRoom(query.get("room")));
     if (req.method === "GET" && url === "/api/gm/brief") {
@@ -673,6 +673,10 @@ async function handleApi(req, res, url, query) {
 
     if (url === "/api/restore") {
       if (r.msgs.length) return json(res, 200, { ok: false });
+      // Each story has an ID that changes when the GM clears it. An old backup (from before a clear) is never restored.
+      const e = str(body.epoch, 40);
+      if (r.epoch && e !== r.epoch) return json(res, 200, { ok: false, stale: true });
+      if (!r.epoch && e) r.epoch = e;
       const list = (Array.isArray(body.msgs) ? body.msgs : []).slice(-60);
       for (const m of list) {
         const text = str(m && m.text, 1500);
@@ -691,8 +695,9 @@ async function handleApi(req, res, url, query) {
       r.msgs = [];
       r.next = 1;
       r.pending = [];
+      r.epoch = str(body.epoch, 40) || Math.random().toString(36).slice(2, 10);
       notify(r);
-      return json(res, 200, { ok: true });
+      return json(res, 200, { ok: true, epoch: r.epoch });
     }
 
     if (url === "/api/gm/brief") {
@@ -974,7 +979,7 @@ const OFF = 0.05; // token inset, as a fraction of a cell
 
 let last = 0, roomId = "test-room", myName = "Player", lastErr = "", inflight = false, serverBusy = false, askBusy = false;
 let dpiCache = 0, pendingMoves = [], tokenNames = {};
-let isGmRole = false, msgCache = [], saveTimer = null, restoring = false;
+let isGmRole = false, msgCache = [], saveTimer = null, restoring = false, epoch = null;
 const lights = {};
 
 const ready = OBR.isAvailable ? new Promise((r) => OBR.onReady(r)) : Promise.resolve();
@@ -1050,7 +1055,7 @@ function scheduleSave() {
   if (!isGmRole || !OBR.isAvailable || saveTimer) return;
   saveTimer = setTimeout(async () => {
     saveTimer = null;
-    try { await OBR.room.setMetadata({ [STORY]: trimStory(msgCache) }); } catch (e) {}
+    try { await OBR.room.setMetadata({ [STORY]: { e: epoch || "", m: trimStory(msgCache) } }); } catch (e) {}
   }, 3000);
 }
 
@@ -1059,11 +1064,14 @@ async function tryRestore() {
   restoring = true;
   try {
     await ready;
-    const story = (await OBR.room.getMetadata())[STORY];
-    if (Array.isArray(story) && story.length) {
+    const saved = (await OBR.room.getMetadata())[STORY];
+    // Saved as { e: story ID, m: messages }; very old versions saved a plain list.
+    const list = Array.isArray(saved) ? saved : (saved && Array.isArray(saved.m) ? saved.m : []);
+    const e = saved && !Array.isArray(saved) ? String(saved.e || "") : "";
+    if (list.length) {
       await api("/api/restore", {
-        room: roomId,
-        msgs: story.map((m) => ({ role: m.r === "d" ? "dm" : "player", who: m.w, text: m.t })),
+        room: roomId, epoch: e,
+        msgs: list.map((m) => ({ role: m.r === "d" ? "dm" : "player", who: m.w, text: m.t })),
       });
       setTimeout(fetchLog, 300);
     }
@@ -1076,8 +1084,13 @@ async function fetchLog() {
   inflight = true;
   try {
     const d = await api(`/api/log?room=${encodeURIComponent(roomId)}&since=${last}`, null, isGmRole && !!$("gmcode").value);
-    if (d.latest < last) { log.innerHTML = ""; last = 0; msgCache = []; }
-    else {
+    const newStory = epoch !== null && (d.epoch || "") !== epoch;
+    epoch = d.epoch || "";
+    if (newStory || d.latest < last) {
+      // The GM cleared the story: wipe the screen and fetch again from the start.
+      log.innerHTML = ""; last = 0; msgCache = [];
+      again = true;
+    } else {
       for (const m of d.msgs) {
         last = m.id;
         add(m.role === "dm" ? "dm" : "you", m.role === "dm" ? m.text : `${m.who}: ${m.text}`);
@@ -1675,14 +1688,20 @@ $("clearBtn").addEventListener("click", async () => {
   const b = $("clearBtn");
   if (!clearArmed) {
     clearArmed = true; b.textContent = "Really clear?";
+    gmStatus("Press \"Really clear?\" again within 4 seconds to erase the story for everyone.");
     setTimeout(() => { clearArmed = false; b.textContent = "Clear story"; }, 4000);
     return;
   }
   clearArmed = false; b.textContent = "Clear story";
   try {
+    const fresh = Math.random().toString(36).slice(2, 10);
+    clearTimeout(saveTimer); saveTimer = null;
     msgCache = [];
-    try { await OBR.room.setMetadata({ [STORY]: [] }); } catch (e) {}
-    await api("/api/clear", { room: roomId }, true); gmStatus("Story cleared."); await fetchLog();
+    try { await OBR.room.setMetadata({ [STORY]: { e: fresh, m: [] } }); } catch (e) {}
+    await api("/api/clear", { room: roomId, epoch: fresh }, true);
+    epoch = fresh; log.innerHTML = ""; last = 0;
+    gmStatus("Story cleared for everyone.");
+    await fetchLog();
   }
   catch (e) { gmStatus("Problem: " + e.message); }
 });
@@ -1971,7 +1990,7 @@ User chose (via questions): GM shares the access code automatically; stat blocks
 - Tested locally with a mocked Open5e and mocked Gemini: lookups, fallbacks, prompt injection, GM-only access all pass. The sandbox cannot reach Open5e, so the real API was only checked by reading its responses.
 **Next:** user uploads v0.6.0 and tests: (1) players no longer see an access code box and still play; (2) messages and DM replies appear instantly for everyone; (3) GM tools -> Show stat blocks lists real stats; (4) DM narration uses correct monster numbers. Then remaining options: refreshed setup guide, dice + combat tracker, session-zero campaign builder, persistent storage in a free database.
 
-## 19. v0.6.1 (latest): bug fixes from the v0.6.0 test (untested live)
+## 19. v0.6.1: bug fixes from the v0.6.0 test (untested live)
 User test of v0.6.0: (1) first "Build map + monsters" failed with "The AI's answer wasn't in the expected format", second click worked; (2) a stray token "Goblin Warrior 1 2" appeared in room 2; (3) an AI move action moved that token when another was meant, onto a square a player already occupied. (Shared access code, live updates and stat blocks were not reported as broken.)
 **Root causes found:**
 - Positions were read with Math.round(position / dpi). Our square tokens are placed at the cell's top-left (+5% inset) but Owlbear player image tokens are placed at the cell CENTRE, so rounding put every player one cell right and down. The AI (and enemy moves) were given wrong player positions. Fix: Math.floor (correct for both).
@@ -1982,4 +2001,11 @@ User test of v0.6.0: (1) first "Build map + monsters" failed with "The AI's answ
 - Client: `matchToken()` = exact name, else a base name only if exactly one token matches, else an error listing the candidates (move, delete, camera). Spawn numbering continues after the highest existing number ("Goblin Warrior 3"); the approval card says "Spawn N more x Name (K already on the map)". `safeMoves()` runs before every move (AI action, Apply, Apply all): each move ends on the nearest cell that is free (no other token, including other moves in the same batch) and walkable (inside a revealed area, not a blocking feature), and the GM status explains any adjustment. `freeCell()` takes an optional walkable set (radius 12). Spawns also use walkable cells.
 - Tested locally: map retry after a cut-off answer, narration rescue, and unit tests of matchToken/freeCell/spawn numbering/floor all pass.
 **Next:** user uploads v0.6.1 and re-tests build, AI spawn/move/remove actions, and Suggest moves near player tokens. Then remaining options: refreshed setup guide, dice + combat tracker, session-zero campaign builder, persistent storage in a free database.
+
+## 20. v0.6.2 (latest): Clear story fix (untested live)
+User report: "the story did not clear when clicking the clear story button".
+**Cause (race made worse by v0.6.0 live updates):** Clear empties the server log and writes an empty backup to room metadata. The server's notify now reaches every panel instantly, faster than Owlbear syncs the GM's metadata write to other clients. A player panel sees an empty log (latest 0), calls tryRestore, reads its still-old local copy of the room metadata, and restores the old story to the server.
+**Fix: story IDs ("epoch").** Server room has `epoch` (string). `/api/clear` sets it to the ID the GM sends (random); `/api/log` returns it. `/api/restore` is refused (`stale: true`) if the server has an epoch and the backup's epoch differs; a fresh server (epoch "") accepts any backup and adopts its epoch. Room metadata `com.aidm/story` is now `{ e: epoch, m: [messages] }` (old plain-array format still read, as epoch ""). Clients reset their display when the epoch changes (as well as when latest < last) and then refetch. Clear button: writes `{e: fresh, m: []}` first, cancels any pending backup save, then calls /api/clear with the same ID; GM status explains the two-press confirm ("Really clear?" within 4 s) and confirms "Story cleared for everyone."
+Tested locally: old-format restore on a fresh server, clear, stale restore refused, play continues, restore with the new ID after a restart.
+**Next:** user re-tests Clear story with a player window open; continue the v0.6.1 tests (build, AI spawn/move/remove, Suggest moves near players).
 
