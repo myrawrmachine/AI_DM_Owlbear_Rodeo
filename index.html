@@ -89,6 +89,7 @@
   <div class="line"><input type="text" id="notes" placeholder="Optional extra instructions (e.g. make it a ruined swamp temple)"></div>
   <div class="line">Cols <input type="number" id="cols" value="60" min="20" max="60"> Rows <input type="number" id="rows" value="40" min="15" max="45"><button id="build">Build map + monsters</button></div>
   <div class="line"><label><input type="checkbox" id="hideRooms" checked> Hide unexplored rooms until revealed</label></div>
+  <div class="line"><label><input type="checkbox" id="artOn" checked> Paint a background picture (free image service)</label><button id="addArt" class="alt">Add art to current map</button></div>
   <div id="legend"></div>
   <div id="rooms"></div>
 
@@ -111,7 +112,7 @@
 </div>
 
 <script type="module">
-import OBR, { buildShape, buildLabel, buildLight } from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm";
+import OBR, { buildShape, buildLabel, buildLight, buildImage } from "https://cdn.jsdelivr.net/npm/@owlbear-rodeo/sdk@3/+esm";
 
 const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("input"), codeEl = $("code"), useMap = $("useMap");
@@ -371,19 +372,53 @@ async function clearGenerated() {
   if (old.length) await OBR.scene.items.deleteItems(old.map((i) => i.id));
 }
 
-function mapRect(dpi, x, y, w, h, fill, stroke, name, z) {
+function mapRect(dpi, x, y, w, h, fill, stroke, name, z, op) {
   return buildShape().width(w * dpi).height(h * dpi).shapeType("RECTANGLE")
-    .position({ x: x * dpi, y: y * dpi }).fillColor(fill).fillOpacity(1)
+    .position({ x: x * dpi, y: y * dpi }).fillColor(fill).fillOpacity(op === undefined ? 1 : op)
     .strokeColor(stroke).strokeWidth(2).layer("MAP").name(name).zIndex(z).locked(true)
     .metadata({ [GEN]: true }).build();
 }
 
-async function drawBase(spec) {
+const imageSize = (url) => new Promise((ok, bad) => {
+  const i = new Image();
+  i.onload = () => ok({ width: i.naturalWidth, height: i.naturalHeight });
+  i.onerror = () => bad(new Error("The art picture could not be loaded."));
+  i.src = url;
+});
+
+// Background (and optional painted art with a dark shade over it). Returns true if the art was used.
+async function drawBase(spec, artUrl) {
   const dpi = await getDpi();
-  await OBR.scene.items.addItems([mapRect(dpi, 0, 0, spec.cols, spec.rows, "#15171f", "#15171f", spec.title, 0)]);
+  const items = [mapRect(dpi, 0, 0, spec.cols, spec.rows, "#15171f", "#15171f", spec.title, 0)];
+  let used = false;
+  if (artUrl) {
+    try {
+      const { width, height } = await imageSize(artUrl);
+      const scale = (dpi * spec.cols) / width;
+      const art = buildImage({ url: artUrl, width, height, mime: "image/jpeg" }, { dpi, offset: { x: 0, y: 0 } })
+        .layer("MAP").scale({ x: scale, y: scale }).zIndex(1).locked(true).name("Map art")
+        .metadata({ [GEN]: true }).build();
+      items.push(art, mapRect(dpi, 0, 0, spec.cols, spec.rows, "#000000", "#000000", "Shade", 2, 0.55));
+      used = true;
+    } catch (e) { console.error(e); }
+  }
+  await OBR.scene.items.addItems(items);
   try {
     await OBR.viewport.animateToBounds({ min: { x: 0, y: 0 }, max: { x: spec.cols * dpi, y: spec.rows * dpi }, width: spec.cols * dpi, height: spec.rows * dpi, center: { x: spec.cols * dpi / 2, y: spec.rows * dpi / 2 } });
   } catch (e) {}
+  return used;
+}
+
+function areaItems(dpi, spec, a, artOn) {
+  const items = [mapRect(dpi, a.x, a.y, a.w, a.h, FLOOR[a.kind] || FLOOR.room, "#6b7090", a.name, 3, artOn ? 0.5 : 1)];
+  for (const f of spec.features.filter((x) => featureOwner(spec, x) === a.name))
+    items.push(mapRect(dpi, f.x, f.y, f.w, f.h, THING[f.kind] || "#8a8a99", "#222", f.name, 4, 1));
+  return items;
+}
+
+async function getArt(spec) {
+  const d = await api("/api/gm/art", { room: roomId, art: spec.art, cols: spec.cols, rows: spec.rows }, true);
+  return location.origin + d.url;
 }
 
 /* ---- adventure state: map, creatures per room, which rooms are revealed (kept on this device) ---- */
@@ -425,9 +460,7 @@ async function revealArea(name, quiet) {
   const dpi = await getDpi();
   const items = [], spawns = [];
   for (const a of group) {
-    items.push(mapRect(dpi, a.x, a.y, a.w, a.h, FLOOR[a.kind] || FLOOR.room, "#6b7090", a.name, 2));
-    for (const f of spec.features.filter((x) => featureOwner(spec, x) === a.name))
-      items.push(mapRect(dpi, f.x, f.y, f.w, f.h, THING[f.kind] || "#8a8a99", "#222", f.name, 3));
+    items.push(...areaItems(dpi, spec, a, !!adv.art));
     spawns.push(...adv.tokens.filter((t) => t.area === a.name));
     adv.revealed.push(a.name);
   }
@@ -505,18 +538,24 @@ busyBtn($("build"), "Building...", async () => {
   if (!(await OBR.scene.isReady())) throw new Error("No scene is open. In Owlbear, create or open a scene first (the scenes menu), then try again.");
   const text = $("brief").value;
   if (!text.trim()) throw new Error("Write or draft a brief in section 1 first.");
-  gmStatus("Step 1 of 3: saving your brief...");
+  gmStatus("Step 1 of 4: saving your brief...");
   store("brief-" + roomId, text);
   await api("/api/gm/brief", { room: roomId, brief: text }, true);
-  gmStatus("Step 2 of 3: the AI is designing the map and monsters. This can take up to a minute...");
+  gmStatus("Step 2 of 4: the AI is designing the map and monsters. This can take up to a minute...");
   const d = await api("/api/gm/build", {
     room: roomId, notes: $("notes").value, cols: +$("cols").value, rows: +$("rows").value,
   }, true);
-  gmStatus("Step 3 of 3: drawing the map...");
+  let artUrl = "", artNote = "";
+  if ($("artOn").checked) {
+    gmStatus("Step 3 of 4: painting the background art (this can take up to a minute)...");
+    try { artUrl = await getArt(d.spec); } catch (e) { artNote = " The art was skipped: " + e.message; }
+  }
+  gmStatus("Step 4 of 4: drawing the map...");
   try {
     await clearGenerated();
-    await drawBase(d.spec);
-    advSet({ spec: d.spec, tokens: d.tokens, revealed: [] });
+    const used = await drawBase(d.spec, artUrl);
+    if (artUrl && !used) artNote = " The art picture could not be loaded.";
+    advSet({ spec: d.spec, tokens: d.tokens, revealed: [], art: used ? artUrl : "" });
     store("map-" + roomId, JSON.stringify(d.spec));
     const start = d.spec.areas.find((a) => a.kind !== "corridor") || d.spec.areas[0];
     if ($("hideRooms").checked) await revealArea(start.name, true);
@@ -529,8 +568,26 @@ busyBtn($("build"), "Building...", async () => {
     (Object.keys(byArea).map((a) => `${a}: ${byArea[a].join(", ")}`).join("\n") || "none");
   renderRooms();
   gmStatus($("hideRooms").checked
-    ? `Done. Only the first room is visible. ${d.spec.areas.length} areas and ${d.tokens.length} creatures are ready; reveal rooms below or let the DM propose it.`
-    : `Done. Built ${d.spec.areas.length} areas and ${d.tokens.length} creatures. If you can't see the map, zoom out in Owlbear.`);
+    ? `Done. Only the first room is visible. ${d.spec.areas.length} areas and ${d.tokens.length} creatures are ready; reveal rooms below or let the DM propose it.${artNote}`
+    : `Done. Built ${d.spec.areas.length} areas and ${d.tokens.length} creatures. If you can't see the map, zoom out in Owlbear.${artNote}`);
+});
+
+busyBtn($("addArt"), "Painting...", async () => {
+  const adv = advGet();
+  if (!adv) throw new Error("Build the map first.");
+  if (!OBR.isAvailable) throw new Error("Open this panel inside an Owlbear room.");
+  await ready;
+  gmStatus("Painting the background art (this can take up to a minute)...");
+  const url = await getArt(adv.spec);
+  const old = await OBR.scene.items.getItems((i) => i.metadata && i.metadata[GEN] === true);
+  if (old.length) await OBR.scene.items.deleteItems(old.map((i) => i.id));
+  adv.art = (await drawBase(adv.spec, url)) ? url : "";
+  const dpi = await getDpi();
+  const items = [];
+  for (const a of adv.spec.areas.filter((x) => adv.revealed.includes(x.name))) items.push(...areaItems(dpi, adv.spec, a, !!adv.art));
+  if (items.length) await OBR.scene.items.addItems(items);
+  advSet(adv);
+  gmStatus(adv.art ? "Art added. Revealed rooms keep their creatures." : "The picture could not be loaded. The flat map was kept.");
 });
 
 busyBtn($("spawn"), "Spawning...", async () => {

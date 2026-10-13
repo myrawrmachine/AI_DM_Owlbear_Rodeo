@@ -26,6 +26,30 @@ const SYSTEM_PROMPT = `You are the Dungeon Master for a group of several players
 - When new enemies or NPCs appear, say clearly who and how many so the GM can place their tokens.
 - End scenes with a prompt like "What do you do?"`;
 
+async function fetchArt(prompt, w, h) {
+  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${w}&height=${h}&nologo=true&seed=${Math.floor(Math.random() * 1e6)}`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 70000);
+    try {
+      const resp = await fetch(url, { signal: ctrl.signal });
+      if (resp.status === 429 && attempt === 0) { await new Promise((ok) => setTimeout(ok, 16000)); continue; }
+      if (!resp.ok) throw new Error("The image service answered " + resp.status + ".");
+      const type = resp.headers.get("content-type") || "";
+      if (!type.startsWith("image/")) throw new Error("The image service didn't return a picture.");
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.length < 1000 || buf.length > 6000000) throw new Error("The picture was empty or too large.");
+      return { buf, type };
+    } catch (e) {
+      if (e.name === "AbortError") throw new Error("The image service took too long. Try again in a minute.");
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw new Error("The image service is busy. Try again in a minute.");
+}
+
 const ACTIONS_PROMPT = `
 
 OUTPUT FORMAT: reply with ONLY valid JSON: {"narration": string, "actions": [ ... ]}
@@ -65,7 +89,7 @@ function sanitizeActions(list) {
 const rooms = {};
 function getRoom(id) {
   id = String(id || "default").slice(0, 100);
-  if (!rooms[id]) rooms[id] = { msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1, adv: null };
+  if (!rooms[id]) rooms[id] = { id, msgs: [], next: 1, busy: false, brief: "", pending: [], aseq: 1, adv: null, art: null, artV: 0 };
   return rooms[id];
 }
 function addMsg(r, role, who, text) {
@@ -182,6 +206,7 @@ function sanitizeMap(s) {
   const list = (v, n) => (Array.isArray(v) ? v.slice(0, n) : []);
   return {
     title: str(s.title, 60) || "Map",
+    art: str(s.art, 200),
     cols,
     rows,
     areas: list(s.areas, 30).map((a) => ({ name: str(a.name, 40) || "Area", kind: str(a.kind, 20) || "room", ...fix(a) })),
@@ -193,8 +218,10 @@ const MAP_SYSTEM = `You design a single top-down battle map that contains an ENT
 Schema: {"title": string, "cols": integer, "rows": integer,
  "areas": [{"name": string, "kind": "room"|"corridor"|"outdoor"|"water", "x": int, "y": int, "w": int, "h": int}],
  "features": [{"name": string, "kind": "pillar"|"door"|"table"|"statue"|"water"|"hazard"|"stairs"|"tree"|"chest"|"altar", "x": int, "y": int, "w": int, "h": int}],
- "creatures": [{"name": string, "count": int, "side": "enemy"|"npc"|"ally", "area": string}]}
+ "creatures": [{"name": string, "count": int, "side": "enemy"|"npc"|"ally", "area": string}],
+ "art": string}
 Rules:
+- "art": 10 to 20 words describing the ground and mood of the whole adventure as a top-down background texture (for example "mossy flooded flagstones, dark swamp ruin, faint torchlight"). No characters and no text.
 - All numbers are whole grid cells (1 cell = 5 feet). x and y are the top-left cell, starting at 0. Everything must fit inside cols x rows.
 - "areas" are the walkable floor. Anything not covered by an area is solid rock or wall.
 - Lay out EVERY scene or location in the adventure notes, in story order, from one end of the map to the other. Name each main area after its scene or location (for example "Scene 1: Flooded Entry"). Link areas with corridors (kind "corridor", 2 cells wide) so everything is reachable.
@@ -363,6 +390,16 @@ async function handleApi(req, res, url, query) {
       return json(res, 200, { ok: true });
     }
 
+    if (url === "/api/gm/art") {
+      const cols = clampInt(body.cols, 10, 60, 40), rows = clampInt(body.rows, 8, 45, 30);
+      const w = 1280, h = Math.max(512, Math.min(1280, Math.round((1280 * rows) / cols)));
+      const art = str(body.art, 200) || "ancient stone dungeon floor, faint torchlight";
+      const prompt = `top-down view, ${art}, painted fantasy battle map ground texture, rich detail, no characters, no text, no grid lines, no border`;
+      r.art = await fetchArt(prompt, w, h);
+      r.artV += 1;
+      return json(res, 200, { url: `/art/${encodeURIComponent(r.id)}.jpg?v=${r.artV}` });
+    }
+
     if (url === "/api/gm/actions/resolve") {
       const ids = new Set((Array.isArray(body.ids) ? body.ids : []).map(Number));
       r.pending = r.pending.filter((a) => !ids.has(a.id));
@@ -452,6 +489,14 @@ http.createServer((req, res) => {
   const url = u.pathname;
   if (req.method === "OPTIONS") { res.writeHead(204, headers("text/plain")); return res.end(); }
   if (url.startsWith("/api/")) return handleApi(req, res, url, u.searchParams);
+  if (req.method === "GET" && url.startsWith("/art/")) {
+    let id = "";
+    try { id = decodeURIComponent(url.slice(5).replace(/\.jpg$/, "")); } catch (e) {}
+    const r = rooms[id];
+    if (!r || !r.art) return json(res, 404, { error: "No art for this room yet." });
+    res.writeHead(200, { ...headers(r.art.type), "Cache-Control": "public, max-age=3600" });
+    return res.end(r.art.buf);
+  }
   if (req.method === "GET" && FILES[url]) {
     const [file, type] = FILES[url];
     return fs.readFile(path.join(__dirname, file), (err, data) => {
