@@ -114,7 +114,21 @@ Create each file with exactly these contents (current version: v0.5.2). `icon.sv
 ### manifest.json
 
 ```json
-
+{
+  "name": "AI Dungeon Master",
+  "version": "0.5.2",
+  "manifest_version": 1,
+  "description": "An AI DM that narrates, drafts one-shots, draws maps and suggests enemy moves.",
+  "author": "You",
+  "icon": "/icon.svg",
+  "action": {
+    "title": "AI Dungeon Master",
+    "icon": "/icon.svg",
+    "popover": "/index.html",
+    "width": 440,
+    "height": 640
+  }
+}
 ```
 
 ### icon.svg
@@ -1630,7 +1644,7 @@ User test of v0.5: art appeared but did not line up with the grid; fog did not h
 **v0.5.2 changes (untested live):**
 - Art prompt is now a floor texture only (MAP_SYSTEM "art" field asks for floor materials/mood only; image prompt says seamless tileable floor texture, no walls/rooms/buildings/doors/furniture).
 - "Rock mask": new `updateMask()` covers every cell that is not a revealed area with solid dark rectangles (MAP layer, zIndex 2, metadata `com.aidm/mask` + `com.aidm/generated`, locked, disableHit), merged row-runs into few rectangles (tested: exact coverage). So the art shows only inside revealed rooms/corridors, and unexplored parts stay dark for everyone without relying on fog. Runs after Build, Reveal, Reveal all, AI reveal action, and Add art. The old 55% "Shade" rectangle was removed; room floors over art now use 30% opacity. Only drawn when art is used. Checkbox label changed to "Paint floor art inside revealed rooms".
-- Manifest version 0.5.2.
+- Manifest version 0.5.2. (A bug in Claude's edit command first shipped an EMPTY manifest.json; Owlbear showed "JSON.parse: unexpected end of data". Fixed file re-sent. Always check file sizes before sending.)
 **Next:** user uploads v0.5.2, rebuilds, reports (a) whether art now appears only inside revealed rooms and looks like floor texture, (b) players' view after revealing a room, (c) how fog was turned on (AI action, Owlbear Fill Fog button) and whether players saw the art faintly or with no fog at all. If fog-based hiding is still wanted, investigate why `OBR.scene.fog.setFilled(true)` does not hide MAP items for players.
 Remaining after that: Item 4 polish (move Access code box into GM tools, SSE instead of polling, refresh setup guide).
 
