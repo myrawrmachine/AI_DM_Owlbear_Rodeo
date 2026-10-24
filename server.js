@@ -221,8 +221,8 @@ const crypto = require("crypto");
 const die = (sides) => crypto.randomInt(1, sides + 1);
 function rollDice(expr) {
   let s = String(expr || "").toLowerCase().replace(/\s+/g, "");
-  if (s === "adv") s = "2d20kh1";
-  if (s === "dis") s = "2d20kl1";
+  // "adv" / "dis" may come with a modifier ("adv+3")
+  s = s.replace(/(^|[+-])(adv|dis)(?=[+-]|$)/g, (m, sign, k) => sign + (k === "adv" ? "2d20kh1" : "2d20kl1"));
   if (!s || s.length > 60) throw new Error("Write a roll like 1d20+5, 2d6+3, adv or dis.");
   const re = /([+-])?(?:(\d*)d(\d+)(kh1|kl1|adv|dis)?|(\d+))/y;
   let pos = 0, total = 0, terms = 0, dice = 0, nat = 0;
@@ -264,7 +264,7 @@ function rollDice(expr) {
 function splitRoll(text) {
   const words = String(text || "").trim().split(/\s+/);
   const dice = [];
-  while (words.length && /^([0-9d+\-]+|kh1|kl1|adv|dis|[0-9d+\-]+(kh1|kl1))$/i.test(words[0])) dice.push(words.shift());
+  while (words.length && /^(?:[0-9d+\-]|kh1|kl1|adv|dis)+$/i.test(words[0])) dice.push(words.shift());
   return { expr: dice.join(""), label: words.join(" ").slice(0, 60) };
 }
 function rollText(expr, label, res) {
@@ -797,14 +797,23 @@ async function runMonsterTurns(r, opts) {
     if (block.list.length) {
       const names = block.list.map((x) => x.name).join(", ");
       addMsg(r, "sys", "Table", `Round ${c.round}: ${names} ${block.list.length > 1 ? "act" : "acts"}.`);
-      await runDm(r, {
-        ...opts,
-        instruction: `[Combat, round ${c.round}] It is now the turn of: ${names} (in this order). Run each one's turn now: ` +
-          `movement (propose move actions; never onto an occupied cell), then attacks, spells or abilities from its stat block. ` +
-          `Use the PRE-ROLLED DICE in order for every attack roll, save and damage roll, and show the math briefly ` +
-          `(for example "Scimitar: 14 + 4 = 18 vs AC 15, hit, 5 slashing damage"). Compare attack totals with the targets' AC from the turn order. ` +
-          `Propose a damage action for every creature in the turn order that takes damage. Do not act for player characters. End by naming whose turn is next.`,
-      });
+      const retry = c.retry;
+      c.retry = false;
+      try {
+        await runDm(r, {
+          ...opts,
+          instruction: `[Combat, round ${c.round}] It is now the turn of: ${names} (in this order). Run each one's turn now: ` +
+            `movement (propose move actions; never onto an occupied cell), then attacks, spells or abilities from its stat block. ` +
+            `Use the PRE-ROLLED DICE in order for every attack roll, save and damage roll, and show the math briefly ` +
+            `(for example "Scimitar: 14 + 4 = 18 vs AC 15, hit, 5 slashing damage"). Compare attack totals with the targets' AC from the turn order. ` +
+            `Propose a damage action for every creature in the turn order that takes damage. Do not act for player characters. End by naming whose turn is next.`,
+        });
+      } catch (e) {
+        // The turn stays on the monsters. The next "Next turn" tries them once more instead of skipping them.
+        c.retry = !retry;
+        e.message += retry ? " Press Next turn to skip the monsters' turn (or narrate it yourself)." : " Press Next turn to try the monsters' turn again.";
+        throw e;
+      }
     }
     for (let k = 0; k < block.steps; k++) { c.turn++; if (c.turn >= c.list.length) { c.turn = 0; c.round++; } }
     if (!alive(c.list[c.turn])) stepTurn(r);
@@ -1027,6 +1036,7 @@ async function handleApi(req, res, url, query) {
       const c = r.combat;
       if (!c) return json(res, 400, { error: "Start combat first." });
       if (r.busy) return json(res, 409, { error: "The DM is still thinking. Wait a moment." });
+      if (!c.list.length) return json(res, 400, { error: "Nobody is in the combat. Put tokens on the map (or have players save My character), then press Start combat again." });
       const opts = { map: str(body.map, 5000), creatures: Array.isArray(body.creatures) ? body.creatures : [] };
       if (url.endsWith("/begin")) {
         if (c.phase === "fight") return json(res, 400, { error: "Combat has already begun. Use Next turn." });
@@ -1039,7 +1049,8 @@ async function handleApi(req, res, url, query) {
         addMsg(r, "sys", "Table", "Round 1. Turn order: " + c.list.map((x) => `${x.name} (${x.init})`).join(", ") + ".");
       } else {
         if (c.phase !== "fight") return json(res, 400, { error: "Press Begin round 1 first." });
-        if (!stepTurn(r)) return json(res, 400, { error: "Nobody in the combat can act." });
+        if (c.retry && c.list[c.turn] && c.list[c.turn].side !== "pc") { /* the monsters' turn failed last time: run it again */ }
+        else { c.retry = false; if (!stepTurn(r)) return json(res, 400, { error: "Nobody in the combat can act." }); }
       }
       combatBump(r);
       if (c.list[c.turn].side === "pc") addMsg(r, "sys", "Table", `Round ${c.round}: it's ${c.list[c.turn].name}'s turn.`);

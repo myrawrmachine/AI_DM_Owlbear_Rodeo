@@ -2,6 +2,6 @@
   "name": "owlbear-dm",
   "version": "0.1.0",
   "description": "AI Dungeon Master for Owlbear Rodeo",
-  "scripts": { "start": "node server.js" },
+  "scripts": { "start": "node server.js", "test": "node --test test/server.test.js" },
   "engines": { "node": ">=18" }
 }

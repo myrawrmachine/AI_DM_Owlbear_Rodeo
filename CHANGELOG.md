@@ -2,7 +2,14 @@
 
 Newest first. Full details for each version are in `AI-DM-Project-Handoff.md` (section number in brackets).
 
-## Unreleased
+## v0.7.1 — 2026-10-25 [§22] — untested live
+- Fix: Adv / Dis with a modifier ("+3 stealth" in the roll box, or typing `adv+3`) used to drop the +3 or fail; a label starting with "d" ("dex save") was dropped by the quick buttons.
+- Fix: Begin round 1 with nobody in the combat crashed with a confusing error; now it explains what to do.
+- Fix: if the AI fails during the monsters' turn (for example the free quota), the next Next turn tries the monsters again instead of silently skipping them (a second failure lets you skip).
+- Added automatic tests (`npm test`, no packages needed) and `docs/LIVE-TEST-CHECKLIST.md` (15-minute live test).
+- **Still to test in a real room:** everything in the checklist (all v0.7.0 features are still untested live).
+
+## Earlier, unreleased
 - Added `CLAUDE.md` and this changelog so the project can be worked on from Claude Code. No app changes.
 
 ## v0.7.0 — 2026-10-13 [§21] — untested live
