@@ -1000,7 +1000,8 @@ $("rollBtn").addEventListener("click", () => roll($("dice").value));
 $("dice").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); roll($("dice").value); } });
 document.querySelectorAll("[data-roll]").forEach((b) => b.addEventListener("click", () => {
   const extra = $("dice").value.trim();
-  roll(b.dataset.roll + (extra && !/^[0-9d+\-]/i.test(extra) ? " " + extra : ""));
+  // "+3 stealth" in the box adds a modifier; a label is added after a space; another dice roll in the box is ignored
+  roll(b.dataset.roll + (!extra ? "" : /^[+-]/.test(extra) ? extra : /^(\d|d\d)/i.test(extra) ? "" : " " + extra));
 }));
 
 /* ---------- my character ---------- */

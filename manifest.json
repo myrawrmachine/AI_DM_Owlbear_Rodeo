@@ -1,6 +1,6 @@
 {
   "name": "AI Dungeon Master",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "manifest_version": 1,
   "description": "An AI DM that narrates, runs combat, builds campaigns and maps, and suggests enemy moves.",
   "author": "You",

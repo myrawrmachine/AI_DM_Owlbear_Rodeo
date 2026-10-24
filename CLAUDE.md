@@ -28,5 +28,6 @@ An AI Dungeon Master extension for Owlbear Rodeo (D&D 2024 / 5.5e, 5+ players). 
 - AI actions on the map need GM approval, except camera moves. Avoid browser `confirm()` (may be blocked in Owlbear's frame); risky buttons use press-twice.
 
 ## Testing
+- Run `npm test` (built-in Node test runner; mocks Gemini/Upstash/Open5e via `test/mock-fetch.js`). Live-room steps for the user: `docs/LIVE-TEST-CHECKLIST.md`.
 - Claude can't open a live Owlbear room. Test locally: run `node server.js` with mocked Gemini/Upstash/Open5e, and load the panel in a browser with a stub Owlbear SDK (outside Owlbear the panel acts as GM).
 - Always tell the user exactly what still needs a live-room test.
